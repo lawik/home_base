@@ -5,7 +5,7 @@ defmodule Home.Manifest do
       config :home_base, :manifest,
         device_id: "nerves-kitchen-01",
         capabilities: [
-          %{id: "spk0", kind: :audio_out, adapter: Home.Adapters.Audio.Capture}
+          %{id: "spk0", kind: :audio_out, adapter: Home.Adapters.Audio.CaptureSpeaker}
         ]
 
   or `config :home_base, :manifest, {:file, path}` for a `.exs` file returning the same keyword.
