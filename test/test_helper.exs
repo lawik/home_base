@@ -12,4 +12,4 @@ Node.set_cookie(:"home_test_#{System.pid()}")
 # from source (`EMERGE_SKIA_BUILD=true`, see docs/EMERGE-FORWARDING.md) to run them.
 inject = if Home.Test.Render.inject_supported?(), do: [], else: [:emerge_inject]
 
-ExUnit.start(exclude: [:portaudio, :v4l2] ++ inject)
+ExUnit.start(exclude: [:portaudio, :v4l2, :drm] ++ inject)

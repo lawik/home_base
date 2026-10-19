@@ -183,10 +183,20 @@ the same video target name collide.
 
 ## Not done / limits
 
-* Window/DRM outputs are configured but only headless is exercised (VM). Tests drive
-  input either as already-hit-tested events (`Compositor.input/2`) or, with a
-  source-built NIF, as raw pointer input into B's renderer (`Compositor.inject/2`),
-  which hit-tests it against A's tree (`test/render_input_test.exs`).
+* Outputs: tests use headless displays, except `test/render_drm_test.exs` (tag `:drm`,
+  excluded by default): B's display is `%Emerge.Config.DRM{card: "/dev/dri/card0"}`
+  with raster presentation (CPU dumb buffers; in the VM, bochs-drm). The test reads
+  what the CRTC scans out with plain DRM ioctls (`test/support/drm/drmgrab.c`) and taps
+  a uinput touchscreen (`utouch.c`) that emerge's bundled libinput picks up, so input
+  goes evdev, libinput, B's hit-testing, A's Solve controller. Needs root, a free card,
+  and a NIF built with a DRM backend:
+  `HOME_EMERGE_BACKENDS='[wayland: [:opengl], drm: [:raster], headless: [:opengl]]'
+  EMERGE_SKIA_BUILD=true mix test --only drm test/render_drm_test.exs` (use a separate
+  `MIX_BUILD_PATH`; the built NIF lands in emerge's `priv/` and also serves the other
+  backends). Other tests drive input as already-hit-tested events
+  (`Compositor.input/2`) or, with a source-built NIF, as raw input into B's renderer
+  (`Compositor.inject/2`). The Wayland window backend is not exercised (no compositor
+  in the VM).
 * Native retained UI state: scroll positions and focus are carried across `move/2`
   and a re-shown session (`Home.Render.Retained`): `Home.Render.Remote` adds
   `on_scroll`/`on_focus`/`on_blur` handlers where the app has none, the session
