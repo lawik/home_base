@@ -29,6 +29,7 @@ defmodule Home.Render.Session do
     :otp_app,
     :renew,
     :input,
+    layer: :normal,
     view: %{},
     hashes: %{},
     files: %{},
@@ -81,7 +82,7 @@ defmodule Home.Render.Session do
 
       case module.start_link(Keyword.put(app_opts, :runtime, runtime)) do
         {:ok, viewport} ->
-          state = %__MODULE__{app: module, viewport: viewport}
+          state = %__MODULE__{app: module, viewport: viewport, layer: opts[:layer] || :normal}
           {:ok, state |> adopt(lease) |> take_input() |> schedule_renew()}
 
         {:error, reason} ->
@@ -95,7 +96,7 @@ defmodule Home.Render.Session do
 
   @impl true
   def handle_call({:renderer_started, config}, _from, state) do
-    state = %{state | otp_app: config.assets.otp_app, view: view(config)}
+    state = %{state | otp_app: config.assets.otp_app, view: view(state, config)}
 
     case attach(state, state.compositor) do
       {:ok, state} -> {:reply, :ok, state}
@@ -104,7 +105,7 @@ defmodule Home.Render.Session do
   end
 
   def handle_call({:configure, config}, _from, state) do
-    view = view(config)
+    view = view(state, config)
 
     if view != state.view do
       state = sync_assets(%{state | view: view}, state.compositor, font_paths(view))
@@ -356,13 +357,13 @@ defmodule Home.Render.Session do
   end
 
   # What the display's renderer needs from the app's config.
-  defp view(%Emerge.Config{} = config) do
+  defp view(state, %Emerge.Config{} = config) do
     fonts =
       for %Emerge.Config.Font{} = font <- config.assets.fonts do
         %Emerge.Config.Font{font | source: Assets.logical(font.source)}
       end
 
-    %{fonts: fonts, input: config.input}
+    %{fonts: fonts, input: config.input, layer: state.layer}
   end
 
   defp font_paths(view), do: Enum.map(Map.get(view, :fonts, []), & &1.source)

@@ -147,12 +147,39 @@ switch back to `{:emerge, "~> 0.x"}`.
 
 ## Layering
 
-`:display` leases are shared. The compositor stacks sessions, latest on top, and draws
-only the top one: emerge has one tree per renderer and one renderer per output (DRM
-can't share a CRTC between renderers). A session that comes back on top gets a fresh
-renderer with its fonts/assets and sends its full tree. Real overlays (a translucent
-notification over an app) would need emerge to compose several encoded trees with
-separate id spaces in one renderer: a third, larger upstream change, not done.
+`:display` leases are shared. The compositor stacks sessions, latest on top. An
+ordinary session hides the ones below it: only it is drawn, and its bytes go to the
+renderer untouched (a session that comes back on top gets a fresh renderer with its
+fonts/assets and sends its full tree). A session shown with `layer: :overlay` is drawn
+over the sessions below it, down to the first ordinary one.
+
+Emerge draws one tree per renderer, so overlays are composed on the display node,
+in Elixir, from the bytes the sessions already send (`Home.Render.Layers`), with no
+emerge change:
+
+* each session gets a layer number; its full tree is decoded
+  (`Emerge.Engine.Serialization.decode/1`) and its patches decoded
+  (`Emerge.Engine.Patch.decode/1`), every id is moved to `layer <<< 48 ||| id`, and the
+  result re-encoded. No diffing and no retained copy of the trees on B: patches are
+  translated op by op;
+* the layers hang in a chain of empty full-size wrappers: wrapper `i` has layer `i`
+  as its `behind` nearby and the next wrapper (the last: the top layer) as its child.
+  `behind` paints under the host's children, so the order is bottom to top. (Mounting
+  layers `in_front` of one root draws the same, but emerge makes `in_front` nearby
+  roots block pointer input to everything under their box, its modal semantics, so a
+  full-size overlay would swallow all presses);
+* element events come back with composed ids: the high bits give the layer, hence the
+  session, which gets the event with its own id; raw input goes to the top session
+  (or the `:input` holder);
+* image and font paths are prefixed with the layer number, and the renderer's single
+  asset source is the directory holding the sessions' asset directories, which are
+  named by layer.
+
+Any change of the visible set restarts the renderer and asks the visible sessions for
+full trees. Cost on B while composed: decode and re-encode of each patch (the plain
+case stays a byte passthrough). Not done: per-layer opacity or placement (an overlay
+is full-size and positions its content itself), and video frames of two layers with
+the same video target name collide.
 
 ## Not done / limits
 

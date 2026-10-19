@@ -183,3 +183,44 @@ defmodule Home.Test.FormViewport do
     {:noreply, Viewport.rerender(%{state | text: text})}
   end
 end
+
+defmodule Home.Test.OverlayViewport do
+  @moduledoc false
+  # Transparent, with a 20x20 button at the top right (x 180..200, y 0..20): green,
+  # yellow once pressed. Presses go to `test` as {:overlay_pressed, n}.
+  use Emerge
+
+  @impl Viewport
+  def mount(opts) do
+    config = %Emerge.Config{runtime: Keyword.get(opts, :runtime, []), assets: [otp_app: :emerge]}
+    {:ok, %{test: opts[:test], presses: 0}, config}
+  end
+
+  @impl Viewport
+  def render(%{presses: presses}) do
+    color = if presses == 0, do: color_rgb(0, 255, 0), else: color_rgb(255, 255, 0)
+
+    el(
+      [width(fill()), height(fill())],
+      Input.button(
+        [
+          key(:ov),
+          align_right(),
+          align_top(),
+          width(px(20)),
+          height(px(20)),
+          Background.color(color),
+          Event.on_press(:pressed)
+        ],
+        none()
+      )
+    )
+  end
+
+  @impl Viewport
+  def handle_info(:pressed, state) do
+    presses = state.presses + 1
+    if state.test, do: send(state.test, {:overlay_pressed, presses})
+    {:noreply, Viewport.rerender(%{state | presses: presses})}
+  end
+end

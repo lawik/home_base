@@ -99,6 +99,9 @@ defmodule Home.Render.Assets do
 
   defp map_sources(other, _fun), do: other
 
+  @doc "Apply `fun` to every image source in an attribute map (also in nested maps)."
+  def map_attr_sources(attrs, fun), do: map_attrs(attrs, fun)
+
   defp map_attrs(attrs, fun) when is_map(attrs) do
     Map.new(attrs, fn
       {:image_src, src} -> {:image_src, fun.(src)}

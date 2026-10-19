@@ -8,9 +8,14 @@ defmodule Home.Render.Compositor do
   (`EmergeSkia.patch_tree_binary/2`). The session keeps emerge's diff state; this
   process only applies bytes. Native input goes back to the session that is shown.
 
-  Sessions stack in attach order, latest on top. Only the top one is drawn: emerge has
-  one tree per renderer, so a session that becomes top gets a fresh renderer (with its
-  own fonts and asset directory) and is asked for a full tree.
+  Sessions stack in attach order, latest on top. Normally only the top one is drawn:
+  a session that becomes top gets a fresh renderer (with its own fonts and asset
+  directory) and is asked for a full tree, and its bytes go to the renderer as they
+  are. A session shown with `layer: :overlay` is drawn over the sessions below it,
+  down to the first ordinary one: emerge has one tree per renderer, so their trees are
+  then composed into one (`Home.Render.Layers`, ids remapped per layer, patches
+  translated op by op). Element events go to the session whose element it is; raw
+  input to the top one (or the `:input` lease holder).
 
   Assets are cached on disk under `<data_dir>/render/assets/<sha256>` (large ones arrive
   over TCP, `Home.Render.AssetTransfer`); each session
@@ -22,6 +27,7 @@ defmodule Home.Render.Compositor do
   require Logger
 
   alias Home.Activity
+  alias Home.Render.Layers
 
   defstruct [
     :cap,
@@ -31,8 +37,11 @@ defmodule Home.Render.Compositor do
     :frame,
     :input_cap,
     :input_route,
+    :composed,
     sessions: %{},
     stack: [],
+    visible: [],
+    next_layer: 1,
     synced?: false
   ]
 
@@ -142,7 +151,7 @@ defmodule Home.Render.Compositor do
     state = put_in(state.sessions[pid].view, view)
     if pid not in state.stack, do: emit(state, :session_started, pid)
     state = %{state | stack: [pid | List.delete(state.stack, pid)]}
-    {:reply, :ok, show_top(state, false)}
+    {:reply, :ok, redraw(state, pid)}
   end
 
   def handle_call({:detach, pid}, _from, state), do: {:reply, :ok, drop(state, pid)}
@@ -230,6 +239,15 @@ defmodule Home.Render.Compositor do
     {:noreply, state}
   end
 
+  def handle_info({:upload, pid, bin}, %{composed: %{}} = state) do
+    if pid in state.visible and state.renderer != nil do
+      {layer_root, subtree} = Layers.full(bin, state.sessions[pid].layer)
+      {:noreply, mount_layer(state, pid, layer_root, subtree, [], :upload)}
+    else
+      {:noreply, state}
+    end
+  end
+
   def handle_info({:upload, pid, bin}, state) do
     if top(state) == pid and state.renderer != nil do
       case EmergeSkia.upload_tree_binary(state.renderer, bin) do
@@ -238,6 +256,24 @@ defmodule Home.Render.Compositor do
       end
     else
       {:noreply, state}
+    end
+  end
+
+  def handle_info({:patch, pid, bin}, %{composed: %{}} = state) do
+    case state.composed.mounted do
+      %{^pid => _} when state.renderer != nil ->
+        case Layers.patch(bin, state.sessions[pid].layer) do
+          {ops, nil} ->
+            {:noreply, apply_ops(state, ops, :patch)}
+
+          # The patch removes the old root itself.
+          {ops, {:new_root, subtree}} ->
+            state = put_in(state.composed.mounted[pid], :removed)
+            {:noreply, mount_layer(state, pid, subtree.id, subtree, ops, :patch)}
+        end
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -258,13 +294,20 @@ defmodule Home.Render.Compositor do
     case state.sessions do
       %{^pid => entry} ->
         updated = %{entry | view: view}
+        new_state = put_in(state.sessions[pid], updated)
 
-        if top(state) == pid and state.renderer != nil do
-          previous = renderer_config(state, entry)
-          _ = EmergeSkia.configure(state.renderer, previous, renderer_config(state, updated))
+        cond do
+          state.composed != nil and pid in state.visible ->
+            {:noreply, redraw(new_state, nil)}
+
+          top(state) == pid and state.renderer != nil ->
+            previous = renderer_config(state, entry)
+            _ = EmergeSkia.configure(state.renderer, previous, renderer_config(state, updated))
+            {:noreply, new_state}
+
+          true ->
+            {:noreply, new_state}
         end
-
-        {:noreply, put_in(state.sessions[pid], updated)}
 
       _ ->
         {:noreply, state}
@@ -273,7 +316,13 @@ defmodule Home.Render.Compositor do
 
   # Frames of a hidden session, or before the tree with the element is up, are dropped.
   def handle_info({:video_frame, pid, target, frame}, state) do
-    if top(state) == pid and state.renderer != nil and state.synced? do
+    drawn? =
+      case state.composed do
+        nil -> top(state) == pid and state.synced?
+        composed -> Map.has_key?(composed.mounted, pid)
+      end
+
+    if drawn? and state.renderer != nil do
       case EmergeSkia.submit_video_frame(state.renderer, target, frame) do
         :ok -> {:noreply, state}
         error -> {:noreply, log_error(state, :video_frame, error)}
@@ -284,7 +333,9 @@ defmodule Home.Render.Compositor do
   end
 
   def handle_info({:emerge_skia_event, event}, state) do
-    if pid = input_target(state, event) do
+    {owner, event} = owner(state, event)
+
+    if pid = input_target(state, owner, event) do
       send(pid, {:home_render_input, self(), event})
       Activity.emit(state.cap, :input, input_kind(event), %{session: pid})
     end
@@ -325,14 +376,25 @@ defmodule Home.Render.Compositor do
   defp top(%{stack: [pid | _]}), do: pid
   defp top(_), do: nil
 
-  # Without an :input capability, the session on top gets the input. With one, only
-  # the process its lease holder routed it to; element events (ids of the drawn tree)
-  # only if that is the drawn session.
-  defp input_target(%{input_cap: nil} = state, _event), do: top(state)
-  defp input_target(%{input_route: nil}, _event), do: nil
+  # The session an element event belongs to (with the event in its own ids), or for raw
+  # input the top one.
+  defp owner(%{composed: nil} = state, event), do: {top(state), event}
 
-  defp input_target(%{input_route: %{target: target}} = state, event) do
-    if raw_input?(event) or target == top(state), do: target
+  defp owner(state, event) do
+    case Layers.route_event(event) do
+      {n, event} -> {Enum.find(state.visible, &(state.sessions[&1].layer == n)), event}
+      nil -> {top(state), event}
+    end
+  end
+
+  # Without an :input capability, element events go to their session and raw input to
+  # the one on top. With one, only to the process its lease holder routed input to;
+  # element events only if they are that session's.
+  defp input_target(%{input_cap: nil}, owner, _event), do: owner
+  defp input_target(%{input_route: nil}, _owner, _event), do: nil
+
+  defp input_target(%{input_route: %{target: target}}, owner, event) do
+    if raw_input?(event) or target == owner, do: target
   end
 
   defp raw_input?({kind, _}) when is_atom(kind), do: true
@@ -358,15 +420,11 @@ defmodule Home.Render.Compositor do
         {entry, state}
 
       _ ->
-        dir =
-          Path.join([
-            state.dir,
-            "sessions",
-            Integer.to_string(System.unique_integer([:positive]))
-          ])
-
+        layer = state.next_layer
+        dir = Path.join([state.dir, "sessions", Integer.to_string(layer)])
         File.mkdir_p!(dir)
-        entry = %{monitor: Process.monitor(pid), view: %{}, dir: dir}
+        entry = %{monitor: Process.monitor(pid), view: %{}, dir: dir, layer: layer}
+        state = %{state | next_layer: layer + 1}
         {entry, put_in(state.sessions[pid], entry)}
     end
   end
@@ -379,40 +437,82 @@ defmodule Home.Render.Compositor do
       {entry, sessions} ->
         Process.demonitor(entry.monitor, [:flush])
         File.rm_rf(entry.dir)
-        was_top? = top(state) == pid
+        was_visible? = pid in state.visible
         if pid in state.stack, do: emit(state, :session_stopped, pid)
         state = %{state | sessions: sessions, stack: List.delete(state.stack, pid)}
-        if was_top?, do: show_top(state, true), else: state
+        if was_visible?, do: redraw(state, nil), else: state
     end
   end
 
-  # (Re)start the renderer for the top session. `resync?` asks that session for a full
-  # tree; a freshly attached session sends one on its own after `attach/3` returns.
-  defp show_top(state, resync?) do
-    state = stop_renderer(state)
+  # The sessions drawn, bottom first: the top one, and below it while the one above
+  # is an overlay.
+  defp visible(state) do
+    state.stack
+    |> Enum.reduce_while([], fn pid, acc ->
+      acc = [pid | acc]
+      if overlay?(state, pid), do: {:cont, acc}, else: {:halt, acc}
+    end)
+  end
 
-    case state.stack do
+  defp overlay?(state, pid), do: Map.get(state.sessions[pid].view, :layer) == :overlay
+
+  # (Re)start the renderer for what is visible now. Sessions other than `fresh` (just
+  # attached; it sends a full tree on its own after `attach/3`) are asked for one.
+  defp redraw(state, fresh) do
+    state = stop_renderer(%{state | visible: visible(state), composed: nil})
+
+    case state.visible do
       [] ->
         emit(state, :blank, nil)
         %{state | frame: nil}
 
-      [pid | _] ->
-        case EmergeSkia.start(renderer_config(state, state.sessions[pid])) do
-          {:ok, renderer} ->
-            :ok = EmergeSkia.set_input_target(renderer, self())
-            :ok = EmergeSkia.set_log_target(renderer, self())
-            if resync?, do: send(pid, {:home_render_resync, self()})
-            %{state | renderer: renderer, synced?: false}
+      [pid] ->
+        start_renderer(state, renderer_config(state, state.sessions[pid]), fn renderer ->
+          if pid != fresh, do: send(pid, {:home_render_resync, self()})
+          %{state | renderer: renderer, synced?: false}
+        end)
 
-          {:error, reason} ->
-            Logger.error("render: renderer start failed: #{inspect(reason)}")
-            state
-        end
+      pids ->
+        start_renderer(state, composed_config(state, pids), fn renderer ->
+          {bin, frame} = Layers.frame(length(pids))
+          :ok = EmergeSkia.upload_tree_binary(renderer, bin)
+          for pid <- pids, pid != fresh, do: send(pid, {:home_render_resync, self()})
+          %{state | renderer: renderer, synced?: true, composed: %{frame: frame, mounted: %{}}}
+        end)
+    end
+  end
+
+  defp start_renderer(state, config, fun) do
+    case EmergeSkia.start(config) do
+      {:ok, renderer} ->
+        :ok = EmergeSkia.set_input_target(renderer, self())
+        :ok = EmergeSkia.set_log_target(renderer, self())
+        fun.(renderer)
+
+      {:error, reason} ->
+        Logger.error("render: renderer start failed: #{inspect(reason)}")
+        state
     end
   rescue
     error ->
       Logger.error("render: renderer start failed: #{Exception.message(error)}")
-      %{state | renderer: nil, synced?: false}
+      %{state | renderer: nil, synced?: false, composed: nil}
+  end
+
+  # Put a session's (new) root at its position in the layer frame.
+  defp mount_layer(state, pid, root, subtree, ops, what) do
+    position = Enum.find_index(state.visible, &(&1 == pid)) + 1
+    old = Map.get(state.composed.mounted, pid)
+    ops = ops ++ Layers.mount(state.composed.frame, position, old, subtree)
+    state = put_in(state.composed.mounted[pid], root)
+    apply_ops(state, ops, what)
+  end
+
+  defp apply_ops(state, ops, what) do
+    case EmergeSkia.patch_tree_binary(state.renderer, Layers.encode(ops)) do
+      :ok -> state
+      error -> log_error(state, what, error)
+    end
   end
 
   defp stop_renderer(%{renderer: nil} = state), do: state
@@ -445,6 +545,24 @@ defmodule Home.Render.Compositor do
           sources: [entry.dir],
           fonts: Map.get(view, :fonts, [])
         }
+    }
+  end
+
+  # Several sessions: their asset directories under one source, paths prefixed by
+  # layer (`Home.Render.Layers`); all their fonts; the top one's input subscriptions.
+  defp composed_config(state, pids) do
+    top = state.sessions[List.last(pids)]
+    config = renderer_config(state, top)
+
+    fonts =
+      for pid <- pids,
+          entry = state.sessions[pid],
+          font <- Map.get(entry.view, :fonts, []),
+          do: %{font | source: Layers.prefix(font.source, entry.layer)}
+
+    %{
+      config
+      | assets: %{config.assets | sources: [Path.join(state.dir, "sessions")], fonts: fonts}
     }
   end
 
