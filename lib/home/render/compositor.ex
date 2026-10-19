@@ -29,6 +29,8 @@ defmodule Home.Render.Compositor do
     :dir,
     :renderer,
     :frame,
+    :input_cap,
+    :input_route,
     sessions: %{},
     stack: [],
     synced?: false
@@ -71,6 +73,23 @@ defmodule Home.Render.Compositor do
   def video_frame(comp, session, target, frame),
     do: send(comp, {:video_frame, session, target, frame})
 
+  ## Input (`Home.Adapters.Input`)
+
+  @doc "The `:input` capability of this display (`{node, id}`), or nil if it has none."
+  def input_cap(comp), do: GenServer.call(comp, :input_cap)
+
+  @doc """
+  Send this display's input to `target` (a render session, or any process: it gets
+  `{:home_render_input, comp, event}`), as the holder of `lease` on its `:input`
+  capability. Lasts until `unroute_input/2`, or the lease holder exits. Raw input goes
+  to `target`; element events only when `target` is the session drawn (they carry ids
+  of the drawn tree).
+  """
+  def route_input(comp, %Home.Lease{} = lease, target),
+    do: GenServer.call(comp, {:route_input, lease, target})
+
+  def unroute_input(comp, %Home.Lease{ref: ref}), do: GenServer.call(comp, {:unroute_input, ref})
+
   ## Display side
 
   @doc """
@@ -109,7 +128,12 @@ defmodule Home.Render.Compositor do
     File.rm_rf!(Path.join(dir, "sessions"))
 
     {:ok,
-     %__MODULE__{cap: Keyword.fetch!(opts, :cap), config: Keyword.fetch!(opts, :config), dir: dir}}
+     %__MODULE__{
+       cap: Keyword.fetch!(opts, :cap),
+       config: Keyword.fetch!(opts, :config),
+       input_cap: Keyword.get(opts, :input),
+       dir: dir
+     }}
   end
 
   @impl true
@@ -142,6 +166,25 @@ defmodule Home.Render.Compositor do
       {:reply, {:error, :unknown_session}, state}
     end
   end
+
+  def handle_call(:input_cap, _from, state), do: {:reply, state.input_cap, state}
+
+  # The lease must be on our input capability and live (renewing it checks both).
+  def handle_call({:route_input, lease, target}, _from, state) do
+    if state.input_cap != nil and lease.cap == state.input_cap and
+         safe(fn -> Home.Lease.renew(lease) end) == :ok do
+      state = clear_route(state)
+      monitor = Process.monitor(lease.holder)
+      {:reply, :ok, %{state | input_route: %{ref: lease.ref, target: target, monitor: monitor}}}
+    else
+      {:reply, {:error, :invalid_lease}, state}
+    end
+  end
+
+  def handle_call({:unroute_input, ref}, _from, %{input_route: %{ref: ref}} = state),
+    do: {:reply, :ok, clear_route(state)}
+
+  def handle_call({:unroute_input, _ref}, _from, state), do: {:reply, :ok, state}
 
   def handle_call(:shown, _from, state), do: {:reply, top(state), state}
   def handle_call(:frame, _from, state), do: {:reply, state.frame, state}
@@ -241,7 +284,7 @@ defmodule Home.Render.Compositor do
   end
 
   def handle_info({:emerge_skia_event, event}, state) do
-    if pid = top(state) do
+    if pid = input_target(state, event) do
       send(pid, {:home_render_input, self(), event})
       Activity.emit(state.cap, :input, input_kind(event), %{session: pid})
     end
@@ -264,6 +307,9 @@ defmodule Home.Render.Compositor do
     {:noreply, state}
   end
 
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{input_route: %{monitor: ref}} = state),
+    do: {:noreply, %{state | input_route: nil}}
+
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state), do: {:noreply, drop(state, pid)}
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -278,6 +324,32 @@ defmodule Home.Render.Compositor do
 
   defp top(%{stack: [pid | _]}), do: pid
   defp top(_), do: nil
+
+  # Without an :input capability, the session on top gets the input. With one, only
+  # the process its lease holder routed it to; element events (ids of the drawn tree)
+  # only if that is the drawn session.
+  defp input_target(%{input_cap: nil} = state, _event), do: top(state)
+  defp input_target(%{input_route: nil}, _event), do: nil
+
+  defp input_target(%{input_route: %{target: target}} = state, event) do
+    if raw_input?(event) or target == top(state), do: target
+  end
+
+  defp raw_input?({kind, _}) when is_atom(kind), do: true
+  defp raw_input?(_), do: false
+
+  defp clear_route(%{input_route: nil} = state), do: state
+
+  defp clear_route(%{input_route: route} = state) do
+    Process.demonitor(route.monitor, [:flush])
+    %{state | input_route: nil}
+  end
+
+  defp safe(fun) do
+    fun.()
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
+  end
 
   # A session is known from its first asset offer; it is drawn once attached.
   defp entry(state, pid) do

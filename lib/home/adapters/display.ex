@@ -12,6 +12,9 @@ defmodule Home.Adapters.Display do
       `%Emerge.Config.DRM{}` or `%Emerge.Config.Headless{}`. Defaults to headless at
       `{meta.w, meta.h}`; a headless output's frames go to the compositor.
     * `:renderer` - an `Emerge.Config.Renderer`. Defaults to `api: :raster`.
+    * `:input` - the id of an `:input` capability on this node (`Home.Adapters.Input`)
+      for the renderer's input devices. Input then goes only to that capability's
+      lease holder. Without it, input goes to the session drawn on top.
 
   The renderer itself starts when a session is shown, not with the capability.
   """
@@ -22,8 +25,16 @@ defmodule Home.Adapters.Display do
 
   @impl true
   def start(%{compositor: nil, cap: cap} = state) do
+    input = Map.get(cap.meta, :input)
+
     {:ok, pid} =
-      Home.Render.Compositor.start_link(cap: {node(), cap.id}, config: config(cap.meta))
+      Home.Render.Compositor.start_link(
+        cap: {node(), cap.id},
+        config: config(cap.meta),
+        input: input && {node(), input}
+      )
+
+    if input, do: Home.Adapters.Input.register(input, pid)
 
     {:ok, %{state | compositor: pid}}
   end

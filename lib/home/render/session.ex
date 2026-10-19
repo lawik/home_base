@@ -17,7 +17,7 @@ defmodule Home.Render.Session do
   require Logger
 
   alias Home.Lease
-  alias Home.Render.{Assets, AssetTransfer, Compositor, Retained}
+  alias Home.Render.{Assets, AssetTransfer, Compositor, InputLease, Retained}
 
   defstruct [
     :app,
@@ -28,6 +28,7 @@ defmodule Home.Render.Session do
     :input_target,
     :otp_app,
     :renew,
+    :input,
     view: %{},
     hashes: %{},
     files: %{},
@@ -81,7 +82,7 @@ defmodule Home.Render.Session do
       case module.start_link(Keyword.put(app_opts, :runtime, runtime)) do
         {:ok, viewport} ->
           state = %__MODULE__{app: module, viewport: viewport}
-          {:ok, schedule_renew(adopt(state, lease))}
+          {:ok, state |> adopt(lease) |> take_input() |> schedule_renew()}
 
         {:error, reason} ->
           Lease.release(lease)
@@ -143,9 +144,10 @@ defmodule Home.Render.Session do
       case attach(adopt(%{state | sent: MapSet.new()}, lease), lease.endpoint) do
         {:ok, new} ->
           resync(new)
+          InputLease.stop(state.input)
           safe(fn -> Compositor.detach(old.endpoint, self()) end)
           Lease.release(old)
-          {:reply, :ok, schedule_renew(new)}
+          {:reply, :ok, new |> take_input() |> schedule_renew()}
 
         {:error, _} = error ->
           Lease.release(lease)
@@ -196,6 +198,7 @@ defmodule Home.Render.Session do
   def terminate(_reason, state) do
     # The viewport traps exits and ignores a :normal one from us.
     if state.viewport, do: Process.exit(state.viewport, :shutdown)
+    InputLease.stop(state.input)
 
     if state.lease do
       safe(fn -> Compositor.detach(state.lease.endpoint, self()) end)
@@ -224,6 +227,14 @@ defmodule Home.Render.Session do
   end
 
   defp adopt(state, lease), do: %{state | lease: lease, compositor: lease.endpoint}
+
+  # The display's :input capability, if it has one (`Home.Render.InputLease`).
+  defp take_input(state) do
+    case InputLease.start_link(state.compositor, self(), state.lease.purpose) do
+      {:ok, pid} -> %{state | input: pid}
+      _ -> %{state | input: nil}
+    end
+  end
 
   # Fonts must be on the display before its renderer starts; images before the tree.
   defp attach(state, comp) do

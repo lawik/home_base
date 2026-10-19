@@ -26,7 +26,17 @@ defmodule Home.Render.Video do
 
   @target :home_video
 
-  defstruct [:display, :compositor, :media, :app, :input_target, :renderer, :tree, view: %{}]
+  defstruct [
+    :display,
+    :compositor,
+    :media,
+    :app,
+    :input_target,
+    :renderer,
+    :tree,
+    :input,
+    view: %{}
+  ]
 
   def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
 
@@ -47,6 +57,7 @@ defmodule Home.Render.Video do
     with {:ok, display} <- acquire_display(target, purpose),
          state = surface(%__MODULE__{display: display, compositor: display.endpoint}, source),
          :ok <- attach(state),
+         state = take_input(state, purpose),
          {:ok, src} <- media_source(source, purpose, opts) |> or_cleanup(state),
          {:ok, state} <- start_media(state, src, display, opts),
          {:ok, state} <- start_app(state, source, opts) do
@@ -235,9 +246,18 @@ defmodule Home.Render.Video do
     end
   end
 
+  # The display's :input capability, if it has one (`Home.Render.InputLease`).
+  defp take_input(state, purpose) do
+    case Home.Render.InputLease.start_link(state.compositor, self(), purpose) do
+      {:ok, pid} -> %{state | input: pid}
+      _ -> state
+    end
+  end
+
   defp cleanup(state) do
     # The app first, so it stops rendering; the media session releases the leases.
     if state.app, do: Process.exit(state.app, :shutdown)
+    Home.Render.InputLease.stop(state.input)
     if state.media, do: Home.Media.Session.stop(state.media)
     safe(fn -> Compositor.detach(state.compositor, self()) end)
     Lease.release(state.display)

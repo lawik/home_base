@@ -63,3 +63,18 @@ defmodule Home.Test.Holders do
     end
   end
 end
+
+defmodule Home.Test.InputHolder do
+  @moduledoc false
+  # Runs on a peer: lease an :input capability, route its input to `test`, hold until
+  # `:release`.
+  def run(test, cap) do
+    {:ok, lease} = Home.Lease.acquire(cap)
+    :ok = Home.Render.Compositor.route_input(lease.endpoint, lease, test)
+    send(test, {:input_holder, self(), lease})
+
+    receive do
+      :release -> Home.Lease.release(lease)
+    end
+  end
+end

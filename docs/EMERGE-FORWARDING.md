@@ -168,5 +168,15 @@ separate id spaces in one renderer: a third, larger upstream change, not done.
   The caret/selection in a text input is not kept (emerge does not report it; a
   restored focus puts the caret at the start): that would need a native
   "export/import runtime state" call.
-* No separate `:input` capability lease; the display's renderer is the input source.
+* `:input` capability: a display declares its input devices as an `:input`
+  capability (`{Home.Adapters.Display, input: "input0"}` plus
+  `%{id: "input0", kind: :input, adapter: Home.Adapters.Input}`); the display adapter
+  registers its compositor as that capability's device. `:input` leases are
+  exclusive. Render, pixel and video sessions lease it next to the display
+  (`Home.Render.InputLease`, retrying every second while someone else holds it) and
+  route it to themselves (`Compositor.route_input/3`); any other process can hold it
+  and route it to itself. With an `:input` capability, input goes only to the routed
+  holder (element events only if that is the session drawn); without one, to the
+  session on top as before. A revoked input lease takes input away from a session,
+  not the display.
 * §6.2 pixel forwarding and §6.3 video surfaces: see `VIDEO.md` (M5).
