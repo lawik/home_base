@@ -8,7 +8,8 @@ defmodule HomeNode.Application do
     # Only configured for targets (config/target.exs): on a dev host this app does nothing.
     children =
       case Application.fetch_env(:home_node, :distribution) do
-        {:ok, opts} -> [{HomeNode.Distribution, opts}]
+        # The probe first: the qemu manifest's synthetic adapters notify it by name.
+        {:ok, opts} -> [HomeNode.Probe, {HomeNode.Distribution, opts}]
         :error -> []
       end
 

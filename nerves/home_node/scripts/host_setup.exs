@@ -5,6 +5,10 @@
 # Naming (see README "Networking"): host nodes are nvN@10.0.3.2, the address the qemu guest
 # dials to reach the host, each listening on 127.0.0.1:4140N. The guest is home@10.0.3.15,
 # reached through the hostfwd on 127.0.0.1:41470. HomeNode.Epmd routes both.
+#
+# Media (README "Media across qemu NAT"): host node nvN receives on 127.0.0.1, UDP ports
+# 41420 + 10 * N .. +9 (nv1: 41430-41439, nv2: 41440-41449; N <= 5), and sends to the guest's
+# advertised 10.0.3.15 through the hostfwd on 127.0.0.1 (same port numbers, 41480-41489).
 
 Code.require_file("../lib/home_node/epmd.ex", __DIR__)
 
@@ -16,6 +20,10 @@ defmodule HostNode do
   def guest, do: @guest
   def name(n), do: :"nv#{n}@#{@host_ip}"
   def port(n), do: 41400 + n
+  def media_ports(n), do: (41420 + 10 * n)..(41429 + 10 * n)
+
+  def media(n),
+    do: [ip: {127, 0, 0, 1}, ports: media_ports(n), routes: %{{10, 0, 3, 15} => {127, 0, 0, 1}}]
 
   def routes(guest_port) do
     host = for n <- 1..9, into: %{}, do: {"nv#{n}@#{@host_ip}", {{127, 0, 0, 1}, port(n)}}
@@ -42,6 +50,7 @@ defmodule HostNode do
           device_id: "host-nv#{n}",
           data_dir: data_dir,
           capabilities: capabilities,
+          media: media(n),
           cluster: [
             backend: {Home.Cluster.Static, nodes: [@guest | Enum.map(peers, &name/1)]},
             interval: 2_000

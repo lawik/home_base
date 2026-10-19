@@ -1,7 +1,9 @@
-# The M0/M1 check against a running qemu guest: run as host node nv1, from the home_base
-# repo root, with the guest booted (scripts/qemu.sh start) and optionally nv2 running:
+# The checks against a running qemu guest (cluster, registry, leases, media across the
+# NAT, reboot and power cycle): run as host node nv1, from the home_base repo root, with
+# the guest booted (scripts/qemu.sh start) and optionally nv2 running:
 #
-#   mix run --no-start nerves/home_node/scripts/demo.exs [--no-reboot] [--no-power-cycle]
+#   mix run --no-start nerves/home_node/scripts/demo.exs \
+#     [--no-media] [--no-reboot] [--no-power-cycle]
 #
 # Exits non-zero on the first failed check. scripts/demo.sh wraps all of it.
 
@@ -9,6 +11,9 @@ Code.require_file("host_setup.exs", __DIR__)
 
 defmodule Demo do
   @qemu Path.expand("qemu.sh", __DIR__)
+  @guest_ids ["cam0", "disp0", "mic0", "pir0", "spk0", "temp0"]
+
+  def guest_ids, do: @guest_ids
 
   def step(title, fun) do
     IO.puts("\n== #{title}")
@@ -70,7 +75,7 @@ defmodule Demo do
 
   def wait_joined(guest, timeout) do
     eventually("#{guest} to join with its capabilities", timeout, fn ->
-      guest in Node.list() and ids(guest_caps(guest)) == ["mic0", "pir0", "temp0"]
+      guest in Node.list() and ids(guest_caps(guest)) == @guest_ids
     end)
   end
 
@@ -100,13 +105,31 @@ defmodule Demo do
   end
 end
 
+# After Demo: it uses Demo.eventually/3 and Demo.fail!/1.
+Code.require_file("media_checks.exs", __DIR__)
+
 opts = System.argv()
 Logger.configure(level: :warning)
 guest = HostNode.guest()
 
+# nv1 records what it plays and has a synthetic mic and a headless display, so media to
+# and from the guest can be measured here.
 me =
   HostNode.start(1, [
-    %{id: "spk-nv1", kind: :audio_out, adapter: Home.Adapters.Null, meta: %{channels: 2}}
+    %{
+      id: "spk-nv1",
+      kind: :audio_out,
+      adapter: Home.Adapters.Audio.CaptureSpeaker,
+      meta: %{channels: 2, notify: self()}
+    },
+    %{
+      id: "mic-nv1",
+      kind: :audio_in,
+      availability: :on_request,
+      adapter: Home.Adapters.Audio.SynthMic,
+      meta: %{click_every: 300, notify: self()}
+    },
+    %{id: "disp-nv1", kind: :display, adapter: Home.Adapters.Display, meta: %{w: 320, h: 240}}
   ])
 
 IO.puts("host node #{me}, looking for #{guest}")
@@ -121,7 +144,7 @@ end)
 
 Demo.step("Home.Registry.list(node: guest) from the host", fn ->
   infos = Demo.show(Demo.guest_caps(guest))
-  Demo.check!(Demo.ids(infos) == ["mic0", "pir0", "temp0"], "guest capabilities listed")
+  Demo.check!(Demo.ids(infos) == Demo.guest_ids(), "guest capabilities listed")
 end)
 
 Demo.step("Home.Registry.list() on the guest (via :erpc) shows host capabilities", fn ->
@@ -151,6 +174,82 @@ Demo.step("holder death on the host releases the guest's mic0", fn ->
     match?(%{status: :idle, hardware: :off}, Demo.info({guest, "mic0"}))
   end)
 end)
+
+unless "--no-media" in opts do
+  # Load all code on both sides first (both run in interactive mode).
+  DemoMedia.preload(node())
+  DemoMedia.preload(guest)
+  :ok = :erpc.call(guest, HomeNode.Probe, :subscribe, [self()])
+  clock = DemoMedia.clock_offset(guest)
+
+  IO.puts(
+    "\n   guest clock - host clock = #{div(clock.offset_us, 1000)} ms " <>
+      "(+- #{div(clock.rtt_us, 2000)} ms, best :erpc round trip #{clock.rtt_us} us)"
+  )
+
+  Demo.step("audio: guest mic0 (:on_request, synthetic) -> nv1 capture speaker", fn ->
+    lat = DemoMedia.audio({guest, "mic0"}, {me, "spk-nv1"}, guest, clock.offset_us, 4_000)
+    IO.puts("   click -> played on nv1: #{DemoMedia.stats(lat)}")
+    Demo.check!(length(lat) >= 8, "at least 8 clicks heard in 4 s")
+    Demo.check!(DemoMedia.p95(lat) <= 250, "p95 <= 250 ms")
+
+    Demo.eventually("mic0 off after the session", 5_000, fn ->
+      match?(%{status: :idle, hardware: :off}, Demo.info({guest, "mic0"}))
+    end)
+  end)
+
+  Demo.step("audio: nv1 mic (synthetic) -> guest spk0 capture speaker", fn ->
+    lat = DemoMedia.audio({me, "mic-nv1"}, {guest, "spk0"}, guest, clock.offset_us, 4_000)
+    IO.puts("   click -> played on guest: #{DemoMedia.stats(lat)}")
+    Demo.check!(length(lat) >= 8, "at least 8 clicks heard in 4 s")
+    Demo.check!(DemoMedia.p95(lat) <= 250, "p95 <= 250 ms")
+  end)
+
+  Demo.step("video: guest cam0 (synthetic H.264, 320x240@30) -> nv1 headless display", fn ->
+    v = DemoMedia.video({guest, "cam0"}, {me, "disp-nv1"}, guest, clock.offset_us, 4_000)
+    IO.puts("   frames sent #{v.sent}, shown on nv1 #{v.shown}")
+    IO.puts("   capture -> on nv1's screen: #{DemoMedia.stats(v.latencies)}")
+    Demo.check!(length(v.latencies) >= 60, "at least 60 frames shown in 4 s")
+    Demo.check!(DemoMedia.p95(v.latencies) <= 250, "p95 <= 250 ms")
+
+    Demo.eventually("cam0 off after the video", 5_000, fn ->
+      match?(%{status: :idle, hardware: :off}, Demo.info({guest, "cam0"}))
+    end)
+  end)
+
+  Demo.step("scene forwarding: emerge app on nv1 -> guest disp0 (headless, 160x120)", fn ->
+    disp = {guest, "disp0"}
+    session = DemoMedia.show_app(disp)
+    DemoMedia.await_pixel(disp, {100, 80}, &DemoMedia.red?/1, 20_000)
+    DemoMedia.await_pixel(disp, {10, 10}, &DemoMedia.green?/1, 5_000)
+    IO.puts("   guest draws the app: background red, button green")
+    button = DemoMedia.button_id(session)
+
+    {fetch_us, _} = :timer.tc(fn -> DemoMedia.pixel(disp, {0, 0}) end)
+
+    rounds =
+      for i <- 1..6 do
+        want = if rem(i, 2) == 1, do: &DemoMedia.blue?/1, else: &DemoMedia.red?/1
+        t0 = DemoMedia.press(disp, button)
+        t_app = receive do: ({:app_pressed, t} -> t), after: (5_000 -> Demo.fail!("no press"))
+        t1 = DemoMedia.await_pixel(disp, {100, 80}, want, 5_000)
+        {(t1 - t0) / 1_000, (t_app - t0) / 1_000}
+      end
+
+    {total, input} = Enum.unzip(rounds)
+    IO.puts("   press on guest -> app on nv1 -> new colour on guest: #{DemoMedia.stats(total)}")
+    IO.puts("     of which press on guest -> app on nv1: #{DemoMedia.stats(input)}")
+
+    IO.puts(
+      "     (each poll fetches the guest's 160x120 frame over :erpc, #{div(fetch_us, 1000)} ms)"
+    )
+
+    Home.Render.stop(session)
+  end)
+
+  :erpc.call(guest, HomeNode.Probe, :unsubscribe, [self()])
+  DemoMedia.flush()
+end
 
 unless "--no-reboot" in opts do
   Demo.step("guest reboots (Nerves.Runtime.reboot/0) and rejoins on its own", fn ->

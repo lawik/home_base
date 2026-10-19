@@ -4,11 +4,13 @@
 #
 #   nerves/home_node/scripts/demo.sh [--build] [--keep] [-- demo.exs args...]
 #
-#   --build   (re)build the firmware first (MIX_TARGET=qemu_aarch64 mix firmware)
+#   --build   (re)build the firmware first (scripts/qemu_gbm_overlay.sh, then
+#             MIX_TARGET=qemu_aarch64 mix firmware)
 #   --keep    leave qemu and nv2 running afterwards
 #
-# Needs mise (erlang/elixir pinned in mise.toml). Ports used on 127.0.0.1: 41401-41402
-# (host nodes), 41470 (guest dist), 41422 (guest ssh).
+# Needs mise (erlang/elixir pinned in mise.toml). Ports used on 127.0.0.1: TCP 41401-41402
+# (host nodes), 41470 (guest dist), 41422 (guest ssh); UDP 41430-41449 (host nodes' media),
+# 41480-41489 (guest media, forwarded).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,6 +39,7 @@ route_check() {
 
 if [[ $build == 1 ]]; then
   (cd "$here" && MIX_TARGET=qemu_aarch64 "$mise" exec -- mix deps.get)
+  "$here/scripts/qemu_gbm_overlay.sh"
   (cd "$here" && MIX_TARGET=qemu_aarch64 "$mise" exec -- mix firmware)
 fi
 
