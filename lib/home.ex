@@ -18,6 +18,8 @@ defmodule Home do
     * `:data_dir` - where secrets, area and other node state persist.
     * `:media` - `[ip: ip_tuple, ports: first..last, routes: %{}]`, the address and UDP range
       media is received on, and destination rewrites for NAT (`Home.Media`).
+    * `:render` - `[asset_tcp_threshold: bytes, ip: ip_tuple, asset_ports: range]`, see
+      `Home.Render.AssetTransfer`.
     * `:ha` - `[area_refresh: ms, timeout: ms, lookup_timeout: ms]`: how often the area is
       looked up (3 h), the timeout per network step (10 s) and for a whole lookup (3 × timeout).
       HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).

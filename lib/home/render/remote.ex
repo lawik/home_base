@@ -16,7 +16,7 @@ defmodule Home.Render.Remote do
 
   @behaviour Emerge.Runtime.Viewport.Renderer
 
-  alias Home.Render.Session
+  alias Home.Render.{Assets, Retained, Session}
 
   @impl true
   def start(config, opts) do
@@ -47,17 +47,27 @@ defmodule Home.Render.Remote do
   @impl true
   def set_input_mask(_session, _mask), do: :ok
 
+  # Runtime-path and preloaded-id images are rewritten to hashed logical paths the
+  # display can resolve (`Home.Render.Assets`), and scroll containers and text inputs
+  # report their state (`Home.Render.Retained`), before emerge diffs the tree.
   @impl true
   def upload_tree(session, tree) do
+    {tree, files} = prepare(session, tree)
     {bin, diff_state, assigned} = Emerge.Engine.encode_full(Emerge.Engine.diff_state_new(), tree)
-    :ok = Session.upload(session, bin, assigned)
+    :ok = Session.upload(session, bin, assigned, files)
     {diff_state, assigned}
   end
 
   @impl true
   def patch_tree(session, diff_state, tree) do
+    {tree, files} = prepare(session, tree)
     {bin, diff_state, assigned} = Emerge.Engine.diff_state_update(diff_state, tree)
-    :ok = Session.patch(session, bin, assigned)
+    :ok = Session.patch(session, bin, assigned, files)
     {diff_state, assigned}
+  end
+
+  defp prepare(session, tree) do
+    {tree, files} = Assets.rewrite(tree)
+    {Retained.instrument(tree, session), files}
   end
 end

@@ -11,8 +11,10 @@ defmodule Home.Render.Video do
   camera and display leases; when it ends (either side gone, a lease revoked or expired)
   this process stops, and when this process stops the media session does too.
 
-  Input on the display comes back here, as for scene forwarding, and is sent to the
-  pixel app (or `:input_to`) as `{:emerge_skia_event, event}`.
+  Input on the display comes back here, as for scene forwarding. For an emerge pixel
+  app it is injected into the app's headless renderer, which hit-tests it against the
+  app's tree (element events work); a non-emerge app (or `:input_to`) gets it as
+  `{:emerge_skia_event, event}`.
 
   Started by `Home.Render.show_video/2` and `Home.Render.show_pixels/2`.
   """
@@ -24,7 +26,17 @@ defmodule Home.Render.Video do
 
   @target :home_video
 
-  defstruct [:display, :compositor, :media, :app, :input_target, :tree, view: %{}]
+  defstruct [
+    :display,
+    :compositor,
+    :media,
+    :app,
+    :input_target,
+    :renderer,
+    :tree,
+    :input,
+    view: %{}
+  ]
 
   def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
 
@@ -45,6 +57,7 @@ defmodule Home.Render.Video do
     with {:ok, display} <- acquire_display(target, purpose),
          state = surface(%__MODULE__{display: display, compositor: display.endpoint}, source),
          :ok <- attach(state),
+         state = take_input(state, purpose),
          {:ok, src} <- media_source(source, purpose, opts) |> or_cleanup(state),
          {:ok, state} <- start_media(state, src, display, opts),
          {:ok, state} <- start_app(state, source, opts) do
@@ -88,9 +101,17 @@ defmodule Home.Render.Video do
 
   @impl true
   def handle_info({:home_render_input, comp, event}, %{compositor: comp} = state) do
-    if state.input_target, do: send(state.input_target, {:emerge_skia_event, event})
+    injected? = state.renderer != nil and inject(state.renderer, event)
+
+    if not injected? and state.input_target,
+      do: send(state.input_target, {:emerge_skia_event, event})
+
     {:noreply, state}
   end
+
+  # The pixel app's headless renderer (`Home.Render.Pixels`), the display's input goes into.
+  def handle_info({:home_pixels_renderer, renderer}, state),
+    do: {:noreply, %{state | renderer: renderer}}
 
   def handle_info({:home_render_resync, comp}, %{compositor: comp} = state) do
     Compositor.upload(comp, self(), state.tree)
@@ -269,12 +290,30 @@ defmodule Home.Render.Video do
     end
   end
 
+  # The display's :input capability, if it has one (`Home.Render.InputLease`).
+  defp take_input(state, purpose) do
+    case Home.Render.InputLease.start_link(state.compositor, self(), purpose) do
+      {:ok, pid} -> %{state | input: pid}
+      _ -> state
+    end
+  end
+
   defp cleanup(state) do
     # The app first, so it stops rendering; the media session releases the leases.
     if state.app, do: Process.exit(state.app, :shutdown)
+    Home.Render.InputLease.stop(state.input)
     if state.media, do: Home.Media.Session.stop(state.media)
     safe(fn -> Compositor.detach(state.compositor, self()) end)
     Lease.release(state.display)
+  end
+
+  # True if the renderer took it (or rejected its shape, e.g. an element event of the
+  # display's own tree); false if this emerge has no input injection (older NIF).
+  defp inject(renderer, event) do
+    _ = EmergeSkia.inject_input(renderer, event)
+    true
+  rescue
+    _ in [ErlangError, UndefinedFunctionError] -> false
   end
 
   defp safe(fun) do

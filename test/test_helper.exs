@@ -7,4 +7,9 @@ System.cmd("epmd", ["-daemon"])
 Application.stop(:home_base)
 Node.set_cookie(:"home_test_#{System.pid()}")
 
-ExUnit.start(exclude: [:portaudio, :v4l2])
+# Element events for pixel forwarding and display-side hit-testing need
+# `EmergeSkia.inject_input/2`, which the precompiled 0.5.0 NIF lacks: build emerge's NIF
+# from source (`EMERGE_SKIA_BUILD=true`, see docs/EMERGE-FORWARDING.md) to run them.
+inject = if Home.Test.Render.inject_supported?(), do: [], else: [:emerge_inject]
+
+ExUnit.start(exclude: [:portaudio, :v4l2, :drm] ++ inject)

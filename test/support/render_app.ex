@@ -83,6 +83,17 @@ defmodule Home.Test.Render do
     {session, app}
   end
 
+  @doc "Start the counter app rendered to pixels (§6.2) on `target`; return `{video, app}`."
+  def show_pixels(target, opts \\ []) do
+    {:ok, app} = GenServer.start(Home.Test.CounterApp, [])
+    viewport_opts = Keyword.merge([app: app], opts)
+
+    {:ok, video} =
+      Home.Render.show_pixels({Home.Test.CounterViewport, viewport_opts}, on: target)
+
+    {video, app}
+  end
+
   def count(app), do: Solve.subscribe(app, :counter).count
 
   @doc "The element id (as emerge sends it in events) of the element keyed `key` in the session's tree."
@@ -119,4 +130,97 @@ defmodule Home.Test.Render do
   end
 
   def shown(cap_id), do: Home.Render.Compositor.shown(compositor(cap_id))
+
+  @doc "Press and release the left button at `{x, y}` on the display's renderer (hit-tested there)."
+  def tap(cap_id, {x, y}) do
+    comp = compositor(cap_id)
+    :ok = Home.Render.Compositor.inject(comp, {:cursor_button, {:left, :press, [], {x, y}}})
+    :ok = Home.Render.Compositor.inject(comp, {:cursor_button, {:left, :release, [], {x, y}}})
+  end
+
+  @doc "Whether the loaded emerge NIF has `EmergeSkia.inject_input/2` (a source build)."
+  def inject_supported? do
+    EmergeSkia.Native.renderer_inject_input(make_ref(), {:focused, true})
+    true
+  catch
+    :error, :nif_not_loaded -> false
+    :error, _ -> true
+  end
+end
+
+defmodule Home.Test.FormViewport do
+  @moduledoc false
+  # A text input on top (y 0..30) and a scroll list below it (y 30..90) of 30 px stripes,
+  # red, blue, red, ... Text changes go to `test` as {:changed, text}.
+  use Emerge
+
+  @impl Viewport
+  def mount(opts) do
+    config = %Emerge.Config{runtime: Keyword.get(opts, :runtime, []), assets: [otp_app: :emerge]}
+    {:ok, %{test: opts[:test], text: ""}, config}
+  end
+
+  @impl Viewport
+  def render(%{text: text}) do
+    column([width(fill()), height(fill()), Background.color(color_rgb(0, 0, 0))], [
+      Input.text(
+        [key(:field), width(px(100)), height(px(30)), Event.on_change(:changed)],
+        text
+      ),
+      column(
+        [key(:list), width(fill()), height(px(60)), scrollbar_y()],
+        for i <- 0..9 do
+          color = if rem(i, 2) == 0, do: color_rgb(255, 0, 0), else: color_rgb(0, 0, 255)
+          el([key(i), width(fill()), height(px(30)), Background.color(color)], none())
+        end
+      )
+    ])
+  end
+
+  @impl Viewport
+  def handle_info({:changed, text}, state) do
+    if state.test, do: send(state.test, {:changed, text})
+    {:noreply, Viewport.rerender(%{state | text: text})}
+  end
+end
+
+defmodule Home.Test.OverlayViewport do
+  @moduledoc false
+  # Transparent, with a 20x20 button at the top right (x 180..200, y 0..20): green,
+  # yellow once pressed. Presses go to `test` as {:overlay_pressed, n}.
+  use Emerge
+
+  @impl Viewport
+  def mount(opts) do
+    config = %Emerge.Config{runtime: Keyword.get(opts, :runtime, []), assets: [otp_app: :emerge]}
+    {:ok, %{test: opts[:test], presses: 0}, config}
+  end
+
+  @impl Viewport
+  def render(%{presses: presses}) do
+    color = if presses == 0, do: color_rgb(0, 255, 0), else: color_rgb(255, 255, 0)
+
+    el(
+      [width(fill()), height(fill())],
+      Input.button(
+        [
+          key(:ov),
+          align_right(),
+          align_top(),
+          width(px(20)),
+          height(px(20)),
+          Background.color(color),
+          Event.on_press(:pressed)
+        ],
+        none()
+      )
+    )
+  end
+
+  @impl Viewport
+  def handle_info(:pressed, state) do
+    presses = state.presses + 1
+    if state.test, do: send(state.test, {:overlay_pressed, presses})
+    {:noreply, Viewport.rerender(%{state | presses: presses})}
+  end
 end

@@ -91,14 +91,30 @@ directory at their logical paths. That directory is B's renderer
 needs no tree rewrite. Fonts go before the renderer starts, images before the tree
 that uses them (messages between two processes are ordered).
 
-Not forwarded: `{:path, abs}` runtime paths and `{:id, _}` preloaded images (local to
-A by definition). Large files go over distribution in one message; the §6.1 "TCP
-socket if large" path is not built.
+Runtime paths (`{:path, abs}`) and preloaded ids (`{:id, "img_<sha256>"}`, emerge's
+canonical id for an image's bytes) only mean something on A. `Home.Render.Remote`
+rewrites them, before emerge diffs the tree, to logical paths named by content hash
+(`_home/<sha256>.<ext>`; `.svg` sniffed for ids), and the session sends those files by
+hash like the rest (`Home.Render.Assets`). A runtime path's hash is cached by size,
+mtime and inode; replacing the file shows the new image on the next render. Bytes for
+ids are kept on A with `Home.Render.Assets.put_image/1`, which returns the id (emerge
+0.5.0 has no public API for registering image bytes, so these ids are only usable
+through forwarding for now). The app's own tree is untouched.
+
+Assets of `asset_tcp_threshold` bytes or more (default 256 KiB, `config :home_base,
+render: [...]`) go over a TCP side channel instead of one distribution message
+(`Home.Render.AssetTransfer`): B listens on its render address (`:ip`, default the
+media IP; `:asset_ports`, default ephemeral) for one connection with a one-time token,
+checks size and sha256 while writing to its cache, and acks; A then sends a `link`
+message, which keeps the ordering "assets before the tree that uses them".
 
 ## Emerge changes (prototyped in `/root/workspace/emerge-home`, patch in `emerge-scene-forwarding.patch`)
 
-Both are small, Elixir-only (no NIF change, so the 0.5.0 precompiled NIF is used),
-and upstream-able:
+The first two are small, Elixir-only (no NIF change, so the 0.5.0 precompiled NIF is
+used), and upstream-able. The third needs a native rebuild; without it everything
+else works and only input injection (pixel-forwarded element events,
+`Compositor.inject/2`) is missing. Scroll/focus keeping, overlays and the asset
+work need no emerge change.
 
 1. **`EmergeSkia.upload_tree_binary/2` and `EmergeSkia.patch_tree_binary/2`**: public
    apply of already-encoded bytes. The transport functions exist
@@ -111,26 +127,97 @@ and upstream-able:
    resolve logical paths inside an OTP app's priv, so B could not draw A's assets
    without rewriting A's tree per display.
 
+3. **`EmergeSkia.inject_input/2`** (branch `home-m8-forwarding`, commit `ada4c6d`, also
+   as `docs/emerge-inject-input.patch`;
+   **needs a native rebuild**): feed raw input (the shapes the renderer reports:
+   `{:cursor_button, {button, action, mods, {x, y}}}`, `{:key, ...}`, ...) into a
+   running renderer's event actor, as if its backend had produced it. Hit-testing,
+   element events, focus, text editing and scrolling then run as for native input,
+   with any backend including headless. Used for pixel forwarding (the display's input
+   goes into the app's headless renderer on A, so `on_press` etc. work) and for input
+   drivers that are not the renderer's own backend (`Home.Render.Compositor.inject/2`).
+   About 30 lines of Rust plus the transport plumbing; the macOS host returns
+   `{:error, :unsupported}`.
+
+Building the NIF from source: put cargo on `PATH` (rustup) and compile with
+`EMERGE_SKIA_BUILD=true` (rustler is a build-only dep of home_base for that). The
+first build takes a while (skia-bindings); the result is copied to emerge's
+`priv/native/emerge_skia.so`. Tests that need injection are tagged `:emerge_inject` and
+are excluded automatically when the loaded NIF lacks it (precompiled 0.5.0).
+
 The fork is a copy of the hex 0.5.0 package source plus the patch, used as a path dep
 (`EMERGE_PATH`, default `/root/workspace/emerge-home`). Once upstream has these,
 switch back to `{:emerge, "~> 0.x"}`.
 
 ## Layering
 
-`:display` leases are shared. The compositor stacks sessions, latest on top, and draws
-only the top one: emerge has one tree per renderer and one renderer per output (DRM
-can't share a CRTC between renderers). A session that comes back on top gets a fresh
-renderer with its fonts/assets and sends its full tree. Real overlays (a translucent
-notification over an app) would need emerge to compose several encoded trees with
-separate id spaces in one renderer: a third, larger upstream change, not done.
+`:display` leases are shared. The compositor stacks sessions, latest on top. An
+ordinary session hides the ones below it: only it is drawn, and its bytes go to the
+renderer untouched (a session that comes back on top gets a fresh renderer with its
+fonts/assets and sends its full tree). A session shown with `layer: :overlay` is drawn
+over the sessions below it, down to the first ordinary one.
+
+Emerge draws one tree per renderer, so overlays are composed on the display node,
+in Elixir, from the bytes the sessions already send (`Home.Render.Layers`), with no
+emerge change:
+
+* each session gets a layer number; its full tree is decoded
+  (`Emerge.Engine.Serialization.decode/1`) and its patches decoded
+  (`Emerge.Engine.Patch.decode/1`), every id is moved to `layer <<< 48 ||| id`, and the
+  result re-encoded. No diffing and no retained copy of the trees on B: patches are
+  translated op by op;
+* the layers hang in a chain of empty full-size wrappers: wrapper `i` has layer `i`
+  as its `behind` nearby and the next wrapper (the last: the top layer) as its child.
+  `behind` paints under the host's children, so the order is bottom to top. (Mounting
+  layers `in_front` of one root draws the same, but emerge makes `in_front` nearby
+  roots block pointer input to everything under their box, its modal semantics, so a
+  full-size overlay would swallow all presses);
+* element events come back with composed ids: the high bits give the layer, hence the
+  session, which gets the event with its own id; raw input goes to the top session
+  (or the `:input` holder);
+* image and font paths are prefixed with the layer number, and the renderer's single
+  asset source is the directory holding the sessions' asset directories, which are
+  named by layer.
+
+Any change of the visible set restarts the renderer and asks the visible sessions for
+full trees. Cost on B while composed: decode and re-encode of each patch (the plain
+case stays a byte passthrough). Not done: per-layer opacity or placement (an overlay
+is full-size and positions its content itself), and video frames of two layers with
+the same video target name collide.
 
 ## Not done / limits
 
-* Window/DRM outputs are configured but only headless is exercised (VM). Input in the
-  tests is injected into the compositor as native-shaped events (`Compositor.input/2`):
-  headless has no pointer, so hit-testing on B is not exercised; the event's element
-  id comes from A's tree.
-* Native retained UI state (scroll offsets, text-input caret, focus) is not carried
-  across `move/2` or a re-shown session; the tree is.
-* No separate `:input` capability lease; the display's renderer is the input source.
+* Outputs: tests use headless displays, except `test/render_drm_test.exs` (tag `:drm`,
+  excluded by default): B's display is `%Emerge.Config.DRM{card: "/dev/dri/card0"}`
+  with raster presentation (CPU dumb buffers; in the VM, bochs-drm). The test reads
+  what the CRTC scans out with plain DRM ioctls (`test/support/drm/drmgrab.c`) and taps
+  a uinput touchscreen (`utouch.c`) that emerge's bundled libinput picks up, so input
+  goes evdev, libinput, B's hit-testing, A's Solve controller. Needs root, a free card,
+  and a NIF built with a DRM backend:
+  `HOME_EMERGE_BACKENDS='[wayland: [:opengl], drm: [:raster], headless: [:opengl]]'
+  EMERGE_SKIA_BUILD=true mix test --only drm test/render_drm_test.exs` (use a separate
+  `MIX_BUILD_PATH`; the built NIF lands in emerge's `priv/` and also serves the other
+  backends). Other tests drive input as already-hit-tested events
+  (`Compositor.input/2`) or, with a source-built NIF, as raw input into B's renderer
+  (`Compositor.inject/2`). The Wayland window backend is not exercised (no compositor
+  in the VM).
+* Native retained UI state: scroll positions and focus are carried across `move/2`
+  and a re-shown session (`Home.Render.Retained`): `Home.Render.Remote` adds
+  `on_scroll`/`on_focus`/`on_blur` handlers where the app has none, the session
+  records the events as they pass, and the full tree for a new renderer carries them
+  as emerge's one-shot `scroll_x/y` fractions and `focus_on_mount`. No emerge change.
+  The caret/selection in a text input is not kept (emerge does not report it; a
+  restored focus puts the caret at the start): that would need a native
+  "export/import runtime state" call.
+* `:input` capability: a display declares its input devices as an `:input`
+  capability (`{Home.Adapters.Display, input: "input0"}` plus
+  `%{id: "input0", kind: :input, adapter: Home.Adapters.Input}`); the display adapter
+  registers its compositor as that capability's device. `:input` leases are
+  exclusive. Render, pixel and video sessions lease it next to the display
+  (`Home.Render.InputLease`, retrying every second while someone else holds it) and
+  route it to themselves (`Compositor.route_input/3`); any other process can hold it
+  and route it to itself. With an `:input` capability, input goes only to the routed
+  holder (element events only if that is the session drawn); without one, to the
+  session on top as before. A revoked input lease takes input away from a session,
+  not the display.
 * §6.2 pixel forwarding and §6.3 video surfaces: see `VIDEO.md` (M5).

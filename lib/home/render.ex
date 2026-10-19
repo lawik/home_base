@@ -25,7 +25,9 @@ defmodule Home.Render do
 
   @doc """
   Start `app_spec` (`{viewport_module, opts}`) on this node, drawn on `on:` (`{node, cap_id}`).
-  Returns the session pid. Options: `:on` (required), `:purpose` (lease purpose).
+  Returns the session pid. Options: `:on` (required), `:purpose` (lease purpose),
+  `:layer` (`:normal`, or `:overlay` to be drawn over the sessions below instead of
+  hiding them; give the app a transparent background).
   """
   @spec show({module(), keyword()}, keyword()) :: {:ok, pid()} | {:error, term()}
   def show({module, opts} = _app_spec, show_opts) when is_atom(module) and is_list(opts) do
