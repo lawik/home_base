@@ -52,6 +52,14 @@ defmodule Home.Render.Compositor do
   def patch(comp, session, bin), do: send(comp, {:patch, session, bin})
   def configure(comp, session, view), do: send(comp, {:configure, session, view})
 
+  @doc """
+  Show `frame` (`%VideoInterop.Frame{}`) in the video element `target` of `session`'s
+  tree (`Emerge.UI.video/2`), if that session is the one drawn. Sent by
+  `Home.Media.VideoSink`.
+  """
+  def video_frame(comp, session, target, frame),
+    do: send(comp, {:video_frame, session, target, frame})
+
   ## Display side
 
   @doc "Feed a native-shaped input event, as if it came from the renderer."
@@ -168,6 +176,18 @@ defmodule Home.Render.Compositor do
 
       _ ->
         {:noreply, state}
+    end
+  end
+
+  # Frames of a hidden session, or before the tree with the element is up, are dropped.
+  def handle_info({:video_frame, pid, target, frame}, state) do
+    if top(state) == pid and state.renderer != nil and state.synced? do
+      case EmergeSkia.submit_video_frame(state.renderer, target, frame) do
+        :ok -> {:noreply, state}
+        error -> {:noreply, log_error(state, :video_frame, error)}
+      end
+    else
+      {:noreply, state}
     end
   end
 

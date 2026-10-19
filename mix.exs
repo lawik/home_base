@@ -33,6 +33,12 @@ defmodule HomeBase.MixProject do
       {:membrane_opus_plugin, "~> 0.20"},
       {:membrane_udp_plugin, "~> 0.14"},
       {:membrane_raw_audio_format, "~> 0.12"},
+      {:membrane_raw_video_format, "~> 0.4"},
+      {:membrane_h264_ffmpeg_plugin, "~> 0.32"},
+      {:membrane_h26x_plugin, "~> 0.10"},
+      {:membrane_rtp_h264_plugin, "~> 0.20"},
+      {:membrane_ffmpeg_swscale_plugin, "~> 0.16"},
+      {:membrane_camera_capture_plugin, "~> 0.7"},
       # emerge 0.5.0 plus the scene-forwarding hooks in docs/EMERGE-FORWARDING.md.
       {:emerge, path: System.get_env("EMERGE_PATH", "/root/workspace/emerge-home")},
       {:solve, "~> 0.3.1"},

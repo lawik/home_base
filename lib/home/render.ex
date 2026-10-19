@@ -37,6 +37,55 @@ defmodule Home.Render do
     )
   end
 
+  @doc """
+  Show video from a `:video_in` capability on a display (§6.3). `source` is a lease on
+  the camera or its `{node, cap_id}`, which is then leased here (an `:on_request` camera
+  turns on). The video fills the display, on top of what it showed.
+
+  The pixels go over a `Home.Media.Session` (`codec: :h264`, RTP/UDP) straight from the
+  camera's node to the display's; see `Home.Render.Video`. Returns the video session
+  pid; `stop/1` stops it, and it stops by itself when either side goes away.
+
+  Options: `:on` (required), `:purpose`, `:bitrate` (H.264 cap, default 3 Mbps),
+  `:gop_size`, `:jitter`, `:input_to` (a pid that gets the display's input events).
+  """
+  @spec show_video(Home.Lease.t() | Home.Capability.ref(), keyword()) ::
+          {:ok, pid()} | {:error, term()}
+  def show_video(source, opts) do
+    target = Keyword.fetch!(opts, :on)
+
+    DynamicSupervisor.start_child(
+      Home.Render.Supervisor,
+      {Home.Render.Video, {source, target, opts}}
+    )
+  end
+
+  @doc """
+  Pixel forwarding (§6.2): run `app_spec` here, render it to frames on this node at the
+  display's size, and stream them as H.264 to `on:`, where they fill the display. Input
+  on the display comes back to the app.
+
+  For an emerge viewport this is a drop-in for `show/2`: it gets the same `runtime:`
+  option, whose adapter (`Home.Render.Pixels`) draws headless here. Any other app
+  started with `module.start_link(opts)` can take part too: it finds the frame sink and
+  size in `opts[:runtime][:adapter_opts]` (`:frames`, `:size`), sends the sink
+  `{:emerge_skia_frame, %VideoInterop.Frame{}}` with binary RGBA frames, and receives
+  input as `{:emerge_skia_event, event}`.
+
+  Options as for `show_video/2`, plus `:fps` (30) and `:renderer` (an
+  `Emerge.Config.Renderer`, default raster).
+  """
+  @spec show_pixels({module(), keyword()}, keyword()) :: {:ok, pid()} | {:error, term()}
+  def show_pixels({module, app_opts} = app_spec, opts)
+      when is_atom(module) and is_list(app_opts) do
+    target = Keyword.fetch!(opts, :on)
+
+    DynamicSupervisor.start_child(
+      Home.Render.Supervisor,
+      {Home.Render.Video, {app_spec, target, opts}}
+    )
+  end
+
   @doc "Draw the session's app on another display. The app keeps running."
   @spec move(pid(), keyword()) :: :ok | {:error, term()}
   def move(session, to: target), do: Home.Render.Session.move(session, target)

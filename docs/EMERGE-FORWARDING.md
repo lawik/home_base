@@ -133,4 +133,4 @@ separate id spaces in one renderer: a third, larger upstream change, not done.
 * Native retained UI state (scroll offsets, text-input caret, focus) is not carried
   across `move/2` or a re-shown session; the tree is.
 * No separate `:input` capability lease; the display's renderer is the input source.
-* No §6.2 pixel-forwarding fallback.
+* §6.2 pixel forwarding and §6.3 video surfaces: see `VIDEO.md` (M5).

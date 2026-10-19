@@ -7,4 +7,4 @@ System.cmd("epmd", ["-daemon"])
 Application.stop(:home_base)
 Node.set_cookie(:"home_test_#{System.pid()}")
 
-ExUnit.start(exclude: [:portaudio])
+ExUnit.start(exclude: [:portaudio, :v4l2])

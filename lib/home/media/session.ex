@@ -17,15 +17,23 @@ defmodule Home.Media.Session do
   If the session can't be set up, `start/1` returns `{:error, reason}`; leases already
   handed over to it are released.
 
+  Video is the same with `codec: :h264` (§5.2, §6.3): the source is a `:video_in` lease
+  and the sinks are `:display` leases, whose endpoint (the display's compositor) shows
+  the frames on the video element `surface: {render_session, target}` (see
+  `Home.Render.show_video/2`). The source can also be a Membrane source element to run
+  on this node instead of a lease, e.g. a `Home.Media.FrameSource` for pixel forwarding.
+
   Options:
 
-    * `:source` - lease on an `:audio_in` capability.
-    * `:sink` or `:sinks` - lease(s) on `:audio_out` capabilities.
-    * `:codec` - only `:opus`.
+    * `:source` - lease on an `:audio_in` (`:video_in`) capability, or a Membrane
+      source element for this node.
+    * `:sink` or `:sinks` - lease(s) on `:audio_out` (`:display`) capabilities.
+    * `:codec` - `:opus` (default) or `:h264`.
+    * `:surface` - for video: `{render_session, target}` the frames are drawn into.
     * `:owner` - the session stops when this process exits. Default: the caller.
     * `:renew_every` - ms between lease renewals, default 30 s.
     * `:jitter` - receiver jitter buffer in ms, default 40.
-    * `:bitrate` - Opus bitrate, default 64 kbps.
+    * `:bitrate` - encoder bitrate, default 64 kbps (Opus) or 3 Mbps (H.264, a cap).
   """
 
   use GenServer, restart: :temporary
@@ -119,7 +127,7 @@ defmodule Home.Media.Session do
   @impl true
   def handle_call(:info, _from, state) do
     reply = %{
-      source: state.source.cap,
+      source: source_ref(state.source),
       sinks: Enum.map(state.sinks, & &1.cap),
       destinations: state.destinations,
       ssrc: state.ssrc,
@@ -178,14 +186,17 @@ defmodule Home.Media.Session do
 
   defp check(opts, sinks) do
     cond do
-      Keyword.get(opts, :codec, :opus) != :opus -> {:error, :unsupported_codec}
+      Keyword.get(opts, :codec, :opus) not in [:opus, :h264] -> {:error, :unsupported_codec}
       sinks == [] -> {:error, :no_sink}
       true -> :ok
     end
   end
 
   defp take_leases(state) do
-    Enum.reduce_while([state.source | state.sinks], {:ok, state}, fn lease, {:ok, state} ->
+    leases =
+      if match?(%Lease{}, state.source), do: [state.source | state.sinks], else: state.sinks
+
+    Enum.reduce_while(leases, {:ok, state}, fn lease, {:ok, state} ->
       case Lease.handover(lease, self()) do
         {:ok, lease} ->
           monitors =
@@ -202,15 +213,16 @@ defmodule Home.Media.Session do
   end
 
   defp start_sinks(state) do
-    [_source | sinks] = state.taken
+    sinks = if match?(%Lease{}, state.source), do: tl(state.taken), else: state.taken
 
     Enum.reduce_while(sinks, {:ok, state}, fn lease, {:ok, state} ->
-      opts = %{
-        ssrc: state.ssrc,
-        session: self(),
-        cap: lease.cap,
-        jitter: Keyword.get(state.opts, :jitter, 40)
-      }
+      opts =
+        Map.merge(media_opts(state), %{
+          ssrc: state.ssrc,
+          session: self(),
+          cap: lease.cap,
+          jitter: Keyword.get(state.opts, :jitter, 40)
+        })
 
       case remote(lease, :start_sink, [lease.endpoint, opts]) do
         {:ok, pipeline, {ip, port, _ssrc}} ->
@@ -223,21 +235,34 @@ defmodule Home.Media.Session do
     end)
   end
 
-  defp start_source(state) do
+  defp start_source(%{source: %Lease{}} = state) do
     [lease | _sinks] = state.taken
-
-    opts = %{
-      ssrc: state.ssrc,
-      session: self(),
-      cap: lease.cap,
-      bitrate: Keyword.get(state.opts, :bitrate, 64_000)
-    }
+    opts = Map.merge(media_opts(state), %{ssrc: state.ssrc, session: self(), cap: lease.cap})
 
     case remote(lease, :start_source, [lease.endpoint, state.destinations, opts]) do
       {:ok, pipeline} -> {:ok, add_pipeline(state, lease, pipeline)}
       {:error, reason} -> {:error, {:source_failed, lease.cap, reason}, state}
     end
   end
+
+  # A source element of the session's own node (no capability, no lease).
+  defp start_source(state) do
+    opts = Map.merge(media_opts(state), %{ssrc: state.ssrc, session: self(), cap: nil})
+
+    case Home.Media.start_source(state.source, state.destinations, opts) do
+      {:ok, pipeline} -> {:ok, add_pipeline(state, %{cap: {node(), :local}}, pipeline)}
+      {:error, reason} -> {:error, {:source_failed, :local, reason}, state}
+    end
+  end
+
+  defp media_opts(state) do
+    state.opts
+    |> Keyword.take([:codec, :bitrate, :surface, :gop_size])
+    |> Map.new()
+  end
+
+  defp source_ref(%Lease{cap: cap}), do: cap
+  defp source_ref(_element), do: {node(), :local}
 
   defp remote(lease, fun, args) do
     :erpc.call(node(lease.server), Home.Media, fun, args, @call_timeout)

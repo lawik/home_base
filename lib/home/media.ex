@@ -20,20 +20,32 @@ defmodule Home.Media do
   Start the receiving pipeline for `endpoint` on a free port of this node's range.
   Returns `{:ok, pipeline, {ip, port, ssrc}}`.
 
-  Options: `:ssrc`, `:session`, `:cap`, `:kind` (`:audio_out`), `:jitter` (ms, 40).
+  Options: `:ssrc`, `:session`, `:cap`, `:codec` (`:opus` or `:h264`), `:kind` (`:audio_out`,
+  or `:display` for video), `:jitter` (ms, 40).
+
+  For video, `endpoint` may be a display's `Home.Render.Compositor`; frames then go to
+  the video element `target` of render session `owner` given as `surface: {owner, target}`
+  (see `Home.Media.VideoSink`).
   """
   def start_sink(endpoint, opts) do
     {ip, ports} = address()
+    opts = Map.new(opts)
+    video? = Map.get(opts, :codec) == :h264
 
     opts =
       opts
-      |> Map.new()
-      |> Map.merge(%{endpoint: endpoint, ip: ip, reply_to: self()})
-      |> Map.put_new(:kind, :audio_out)
+      |> Map.merge(%{endpoint: sink_endpoint(endpoint, opts), ip: ip, reply_to: self()})
+      |> Map.put_new(:codec, :opus)
+      |> Map.put_new(:kind, if(video?, do: :display, else: :audio_out))
       |> Map.put_new(:jitter, 40)
 
     open_sink(Enum.to_list(ports), opts)
   end
+
+  defp sink_endpoint(comp, %{codec: :h264, surface: {owner, target}}) when is_pid(comp),
+    do: %Home.Media.VideoSink{compositor: comp, owner: owner, target: target}
+
+  defp sink_endpoint(endpoint, _opts), do: endpoint
 
   defp open_sink([], _opts), do: {:error, :no_free_port}
 
@@ -64,17 +76,22 @@ defmodule Home.Media do
   Start the sending pipeline for `endpoint` to `destinations` (`[{ip, port}]`).
   Returns `{:ok, pipeline}`.
 
-  Options: `:ssrc`, `:session`, `:cap`, `:kind` (`:audio_in`), `:bitrate` (64 kbps),
-  `:application` (`:voip`).
+  Options: `:ssrc`, `:session`, `:cap`, `:codec` (`:opus` or `:h264`), `:kind`
+  (`:audio_in` or `:video_in`), `:bitrate` (64 kbps for Opus, 3 Mbps for H.264),
+  `:application` (Opus, `:voip`), `:gop_size` (H.264 frames between keyframes, 30).
   """
   def start_source(endpoint, destinations, opts) do
+    opts = Map.new(opts)
+    video? = Map.get(opts, :codec) == :h264
+
     opts =
       opts
-      |> Map.new()
       |> Map.merge(%{endpoint: endpoint, destinations: destinations})
-      |> Map.put_new(:kind, :audio_in)
-      |> Map.put_new(:bitrate, 64_000)
+      |> Map.put_new(:codec, :opus)
+      |> Map.put_new(:kind, if(video?, do: :video_in, else: :audio_in))
+      |> Map.put_new(:bitrate, if(video?, do: 3_000_000, else: 64_000))
       |> Map.put_new(:application, :voip)
+      |> Map.put_new(:gop_size, 30)
 
     start_pipeline(Home.Media.SourcePipeline, opts)
   end
@@ -106,6 +123,8 @@ defmodule Home.Media do
 
   @doc false
   # Emit :stream_started now and :stream_stopped when the pipeline goes, however it goes.
+  def announce_stream(_resource_guard, nil, _kind, _session), do: :ok
+
   def announce_stream(resource_guard, cap, kind, session) do
     Home.Activity.emit(cap, kind, :stream_started, %{session: session})
 
