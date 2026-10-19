@@ -33,9 +33,12 @@ defmodule Home.Test.MediaHelpers do
   end
 
   @doc "Inputs of the mixer behind a `Home.Adapters.Audio.Mixer` speaker on this node."
-  def mixer_inputs(cap) do
+  def mixer_inputs(cap), do: Home.Media.Mixer.inputs(mixer(cap))
+
+  @doc "The mixer pipeline behind a `Home.Adapters.Audio.Mixer` speaker on this node."
+  def mixer(cap) do
     {:ok, server} = Home.Registry.whereis(cap)
-    Home.Media.Mixer.inputs(:sys.get_state(server).astate.mixer)
+    :sys.get_state(server).astate.mixer
   end
 
   @doc """

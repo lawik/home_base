@@ -8,16 +8,25 @@ defmodule Home.Media.Mixer do
   element, which forwards decoded audio here; the mixer gets one input pad per such element
   and drops it when the element goes away.
 
+  The first input's format is the mix's; an input in another s16le format (rate or
+  channels) is converted on the way in (`Home.Media.Mixer.Convert`) rather than
+  taking the mix down.
+
   Options: `:output` (the endpoint child), `:slack` (extra ms of headroom per input, default
   0: the session's jitter buffer already starts each input with a queue).
   """
 
   use Membrane.Pipeline
 
-  alias Membrane.Time
+  require Logger
+
+  alias Membrane.{RawAudio, Time}
 
   @doc false
   def start_link(opts), do: Membrane.Pipeline.start_link(__MODULE__, Map.new(opts))
+
+  @doc "Start without a link to the caller (who should monitor the pipeline)."
+  def start(opts), do: Membrane.Pipeline.start(__MODULE__, Map.new(opts))
 
   @doc "Number of sessions currently feeding the mixer."
   def inputs(mixer), do: Membrane.Pipeline.call(mixer, :inputs)
@@ -28,25 +37,21 @@ defmodule Home.Media.Mixer do
       child(:mixer, %Membrane.LiveAudioMixer{latency: 0})
       |> child(:output, opts.output)
 
-    {[spec: spec], %{slack: Map.get(opts, :slack, 0), inputs: %{}}}
+    {[spec: spec], %{slack: Map.get(opts, :slack, 0), inputs: %{}, format: nil}}
   end
 
   @impl true
   def handle_info({:mixer_input, from, {:format, format}}, _ctx, state) do
-    if Map.has_key?(state.inputs, from) do
-      {[], state}
-    else
-      Process.monitor(from)
+    cond do
+      Map.has_key?(state.inputs, from) ->
+        {[], state}
 
-      spec =
-        child({:input, from}, %Home.Media.Mixer.Source{
-          format: format,
-          delay: Time.milliseconds(state.slack)
-        })
-        |> via_in(:input, options: [offset: :live])
-        |> get_child(:mixer)
+      not convertible?(format, state.format) ->
+        Logger.warning("mixer: can't mix #{inspect(format)} into #{inspect(state.format)}")
+        {[], state}
 
-      {[spec: spec], put_in(state.inputs[from], {:starting, []})}
+      true ->
+        add_input(from, format, state)
     end
   end
 
@@ -71,6 +76,30 @@ defmodule Home.Media.Mixer do
   end
 
   def handle_info(_msg, _ctx, state), do: {[], state}
+
+  defp add_input(from, format, state) do
+    Process.monitor(from)
+    mix = state.format || format
+
+    spec =
+      child({:input, from}, %Home.Media.Mixer.Source{
+        format: format,
+        output_format: mix,
+        delay: Time.milliseconds(state.slack)
+      })
+      |> via_in(:input, options: [offset: :live])
+      |> get_child(:mixer)
+
+    {[spec: spec], %{put_in(state.inputs[from], {:starting, []}) | format: mix}}
+  end
+
+  defp convertible?(_format, nil), do: true
+  defp convertible?(format, format), do: true
+
+  defp convertible?(%RawAudio{sample_format: :s16le}, %RawAudio{sample_format: :s16le}),
+    do: true
+
+  defp convertible?(_format, _mix), do: false
 
   @impl true
   def handle_call(:inputs, _ctx, state), do: {[reply: map_size(state.inputs)], state}

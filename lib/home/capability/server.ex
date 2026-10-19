@@ -142,15 +142,18 @@ defmodule Home.Capability.Server do
   end
 
   @impl true
-  def handle_info({:DOWN, mref, :process, _pid, _reason}, state) do
+  def handle_info({:DOWN, mref, :process, _pid, _reason} = msg, state) do
     case Enum.find(state.leases, fn {_ref, entry} -> entry.monitor == mref end) do
       {ref, _} -> {:noreply, drop(state, ref, :released)}
-      nil -> {:noreply, state}
+      # Not a holder: perhaps a process the adapter monitors.
+      nil -> adapter_info(msg, state)
     end
   end
 
-  def handle_info(msg, state) do
-    # Adapters may run processes that report back to the capability (e.g. levels).
+  def handle_info(msg, state), do: adapter_info(msg, state)
+
+  # Adapters may run processes that report back to the capability (e.g. levels).
+  defp adapter_info(msg, state) do
     if function_exported?(state.adapter, :handle_info, 2) do
       {:ok, astate} = state.adapter.handle_info(msg, state.astate)
       {:noreply, %{state | astate: astate}}
