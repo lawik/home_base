@@ -25,7 +25,11 @@ defmodule Home.Media.CaptureSink do
   def_input_pad(:input, accepted_format: %RawAudio{sample_format: :s16le})
 
   def_options(
-    notify: [spec: pid() | nil, default: nil, description: "Gets onsets and stats."],
+    notify: [
+      spec: Process.dest() | nil,
+      default: nil,
+      description: "Gets onsets and stats (a pid or registered name)."
+    ],
     cap: [spec: term(), default: nil, description: "Capability ref for notify."],
     threshold: [spec: pos_integer(), default: 8_000, description: "Onset level."],
     quiet_ms: [spec: pos_integer(), default: 200, description: "Gap between onsets."],
@@ -121,6 +125,6 @@ defmodule Home.Media.CaptureSink do
 
   defp stats(state), do: state
 
-  defp notify(%{opts: %{notify: pid}}, msg) when is_pid(pid), do: send(pid, msg)
+  defp notify(%{opts: %{notify: dest}}, msg) when dest != nil, do: send(dest, msg)
   defp notify(_, _), do: :ok
 end

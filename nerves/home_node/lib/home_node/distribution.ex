@@ -7,6 +7,9 @@ defmodule HomeNode.Distribution do
   application. home_base has to come after distribution: its `:pg` groups and node state
   are keyed on `node()`.
 
+  The same address is the default media address (`config :home_base, media: [ip: ...]`):
+  sinks on this node bind it and advertise it to sources.
+
   Today the interface is `eth0` (qemu, Ethernet); with Tailscale it becomes `tailscale0`
   and the node is `home@<tailscale ip>` (plan §2.1).
 
@@ -55,6 +58,9 @@ defmodule HomeNode.Distribution do
       {:ok, _} = Node.start(name, :longnames)
       Logger.info("distribution started as #{name}")
     end
+
+    media = Application.get_env(:home_base, :media, [])
+    Application.put_env(:home_base, :media, Keyword.put_new(media, :ip, ip))
 
     {:ok, _} = Application.ensure_all_started(:home_base, :permanent)
     Logger.info("home_base started on #{node()}")

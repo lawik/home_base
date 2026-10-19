@@ -9,6 +9,8 @@
 # host is 10.0.3.2 from inside. Host-side forwards (loopback only):
 #   127.0.0.1:${HOME_NODE_DIST_PORT:-41470} -> guest 4370  (Erlang distribution)
 #   127.0.0.1:${HOME_NODE_SSH_PORT:-41422}  -> guest 22    (nerves_ssh)
+#   127.0.0.1:41480-41489/udp -> guest 41480-41489/udp     (media sinks on the guest; same
+#                                                          port numbers, see qemu_aarch64.exs)
 # Serial console output goes to _build/qemu/console.log.
 set -euo pipefail
 
@@ -20,6 +22,7 @@ pidfile="$dir/qemu.pid"
 log="$dir/console.log"
 dist_port="${HOME_NODE_DIST_PORT:-41470}"
 ssh_port="${HOME_NODE_SSH_PORT:-41422}"
+media_ports=(41480 41481 41482 41483 41484 41485 41486 41487 41488 41489)
 
 running() { [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
 
@@ -42,11 +45,14 @@ start() {
   loader="$HOME/.nerves/artifacts/nerves_system_qemu_aarch64-portable-$version/images/little_loader.elf"
   [[ -f "$loader" ]] || { echo "no bootloader at $loader" >&2; exit 1; }
 
+  netdev="user,id=eth0,net=10.0.3.0/24,hostfwd=tcp:127.0.0.1:$dist_port-:4370,hostfwd=tcp:127.0.0.1:$ssh_port-:22"
+  for p in "${media_ports[@]}"; do netdev+=",hostfwd=udp:127.0.0.1:$p-:$p"; done
+
   : >"$log"
   qemu-system-aarch64 \
     -machine virt -cpu cortex-a53 -smp 2 -m 512M \
     -kernel "$loader" \
-    -netdev "user,id=eth0,net=10.0.3.0/24,hostfwd=tcp:127.0.0.1:$dist_port-:4370,hostfwd=tcp:127.0.0.1:$ssh_port-:22" \
+    -netdev "$netdev" \
     -device virtio-net-device,netdev=eth0,mac=fe:db:ed:de:d0:01 \
     -global virtio-mmio.force-legacy=false \
     -drive "if=none,file=$disk,format=raw,id=vdisk" \

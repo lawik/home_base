@@ -31,7 +31,7 @@ defmodule Home.Media.SynthSource do
     click_ms: [spec: pos_integer(), default: 10, description: "Click length."],
     tone_hz: [spec: pos_integer(), default: 1_000, description: "Click tone."],
     amplitude: [spec: float(), default: 0.6, description: "Click peak, 0..1."],
-    notify: [spec: pid() | nil, default: nil, description: "Gets click times."],
+    notify: [spec: Process.dest() | nil, default: nil, description: "Gets click times."],
     cap: [spec: term(), default: nil, description: "Capability ref for notify."]
   )
 
