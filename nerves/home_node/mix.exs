@@ -75,9 +75,15 @@ defmodule HomeNode.MixProject do
       # Loaded, not started, at boot: HomeNode.Distribution starts it after Node.start/2.
       applications: [home_base: :load],
       include_erts: &Nerves.Release.erts/0,
-      steps: [&Nerves.Release.init/1, :assemble],
+      steps: [&Nerves.Release.init/1, :assemble, &prune_native/1],
       strip_beams: Mix.env() == :prod or [keep: ["Docs"]]
     ]
+  end
+
+  # Drop native files the target doesn't load (see rel/prune_native.exs).
+  defp prune_native(release) do
+    Code.require_file("rel/prune_native.exs", __DIR__)
+    HomeNode.PruneNative.run(release)
   end
 
   defp listeners(_, _), do: []

@@ -16,6 +16,17 @@ host_nodes = %{
 
 config :home_node, :epmd, port: 4370, routes: host_nodes
 
+# Bigger rootfs partitions than the system's 50 MB (Membrane's ffmpeg + emerge's NIF).
+config :nerves, :firmware, fwup_conf: "config/qemu_aarch64/fwup.conf"
+
+# libgbm for emerge's NIF, copied from the rpi4 system by scripts/qemu_gbm_overlay.sh.
+# Without it the guest still boots and does audio and video, but has no display.
+gbm_overlay = Path.expand("../_build/qemu_gbm_overlay", __DIR__)
+
+if File.dir?(gbm_overlay) do
+  config :nerves, :firmware, rootfs_overlay: ["rootfs_overlay", gbm_overlay]
+end
+
 config :home_base,
   device_id: "nerves-qemu",
   cluster: [
