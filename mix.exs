@@ -33,6 +33,8 @@ defmodule HomeBase.MixProject do
       {:membrane_opus_plugin, "~> 0.20"},
       {:membrane_udp_plugin, "~> 0.14"},
       {:membrane_raw_audio_format, "~> 0.12"},
+      {:membrane_portaudio_plugin, "~> 0.19"},
+      {:membrane_audio_mix_plugin, "~> 0.16"},
       {:bandit, "~> 1.5", only: :test},
       {:websock_adapter, "~> 0.5", only: :test}
     ]
