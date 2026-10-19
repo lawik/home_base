@@ -1,7 +1,11 @@
 defmodule Home.Cluster do
   @moduledoc """
-  Keeps this node connected to every peer its source reports. Re-queries the source every
-  `interval` ms and on every nodedown. All nodes mesh fully; none is special.
+  Keeps this node connected to every peer its discovery backend reports. Re-queries the
+  backend every `interval` ms and on every nodedown. All nodes mesh fully; none is special.
+
+  A backend is a module implementing `c:peers/1`: `Home.Cluster.Static`,
+  `Home.Cluster.Epmd` (several nodes on one machine), `Home.Cluster.Tailscale`.
+  Configure with `cluster: [backend: module | {module, opts}, interval: ms]`.
   """
 
   use GenServer
@@ -11,19 +15,25 @@ defmodule Home.Cluster do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "Query the source and connect now."
+  @doc "Query the backend and connect now."
   def sync, do: GenServer.call(__MODULE__, :sync)
 
   @impl true
   def init(opts) do
-    {source, source_opts} =
-      case Keyword.get(opts, :source, Home.Cluster.Epmd) do
+    {backend, backend_opts} =
+      case Keyword.get(opts, :backend, Home.Cluster.Epmd) do
         {mod, mod_opts} -> {mod, mod_opts}
         mod -> {mod, []}
       end
 
     :net_kernel.monitor_nodes(true)
-    state = %{source: source, opts: source_opts, interval: Keyword.get(opts, :interval, 30_000)}
+
+    state = %{
+      backend: backend,
+      opts: backend_opts,
+      interval: Keyword.get(opts, :interval, 30_000)
+    }
+
     send(self(), :tick)
     {:ok, state}
   end
@@ -45,9 +55,9 @@ defmodule Home.Cluster do
 
   def handle_info({:nodeup, _node}, state), do: {:noreply, state}
 
-  defp connect(%{source: source, opts: opts}) do
+  defp connect(%{backend: backend, opts: opts}) do
     if Node.alive?() do
-      case source.peers(opts) do
+      case backend.peers(opts) do
         {:ok, peers} ->
           for peer <- peers, peer != node(), peer not in Node.list() do
             Node.connect(peer)
@@ -56,7 +66,7 @@ defmodule Home.Cluster do
           :ok
 
         {:error, reason} = error ->
-          Logger.debug("cluster source #{inspect(source)} failed: #{inspect(reason)}")
+          Logger.debug("cluster backend #{inspect(backend)} failed: #{inspect(reason)}")
           error
       end
     else

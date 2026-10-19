@@ -120,7 +120,7 @@ different hostfwd ports.
 - `config :home_node, :distribution, interface: "tailscale0"`, so the node is
   `home@<tailscale ip>`. Tailscale IPs are stable, so the name survives reboots and
   network changes. With `eth0`, the name follows whatever DHCP hands out at boot.
-- The cluster source becomes `{Home.Cluster.Tailscale, []}` instead of `Static`, which
+- The cluster backend becomes `{Home.Cluster.Tailscale, []}` instead of `Static`, which
   needs a `tailscale` CLI or local API on the device (plan §9, open).
 - No NAT means no routes. Drop `config/qemu_aarch64.exs`'s routes, or drop
   `HomeNode.Epmd` entirely for stock `erl_epmd` with

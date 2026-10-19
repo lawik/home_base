@@ -128,7 +128,7 @@ config :home_base,
     }
   ],
   # Static until Tailscale is on the device; then {Home.Cluster.Tailscale, []}.
-  cluster: [source: {Home.Cluster.Static, nodes: []}, interval: 5_000]
+  cluster: [backend: {Home.Cluster.Static, nodes: []}, interval: 5_000]
 
 # Target specific config (qemu networking). Must stay at the bottom.
 if File.exists?(Path.join(__DIR__, "#{Mix.target()}.exs")) do

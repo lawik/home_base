@@ -26,7 +26,7 @@ defmodule Home.ClusterTest do
 
   test "three nodes find each other via epmd, and a restarted node rejoins" do
     names = [:m0a, :m0b, :m0c]
-    opts = fn -> [cluster: [source: {Home.Cluster.Epmd, prefix: "m0"}, interval: 500]] end
+    opts = fn -> [cluster: [backend: {Home.Cluster.Epmd, prefix: "m0"}, interval: 500]] end
     peers = for n <- names, do: start(n, opts.())
     nodes = Enum.map(peers, &elem(&1, 1))
 

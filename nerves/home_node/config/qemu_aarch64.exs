@@ -19,6 +19,6 @@ config :home_node, :epmd, port: 4370, routes: host_nodes
 config :home_base,
   device_id: "nerves-qemu",
   cluster: [
-    source: {Home.Cluster.Static, nodes: Enum.map(Map.keys(host_nodes), &String.to_atom/1)},
+    backend: {Home.Cluster.Static, nodes: Enum.map(Map.keys(host_nodes), &String.to_atom/1)},
     interval: 5_000
   ]

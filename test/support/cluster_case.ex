@@ -22,7 +22,7 @@ defmodule Home.Test.ClusterCase do
     peers =
       for {{suffix, opts}, node} <- Enum.zip(specs, names) do
         opts =
-          [cluster: [source: {Home.Cluster.Static, nodes: names}, interval: 500]]
+          [cluster: [backend: {Home.Cluster.Static, nodes: names}, interval: 500]]
           |> Keyword.merge(data_dir: Path.join(tmp, to_string(suffix)))
           |> Keyword.merge(opts)
 

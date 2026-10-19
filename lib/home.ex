@@ -7,14 +7,14 @@ defmodule Home do
         capabilities: [
           %{id: "spk0", kind: :audio_out, adapter: Home.Adapters.Audio.PortAudioOut}
         ],
-        cluster: [source: Home.Cluster.Tailscale],
+        cluster: [backend: Home.Cluster.Tailscale],
         data_dir: "/data/home"
 
   Options:
 
     * `:device_id` - stable id, also the id used in HA/MQTT discovery. Defaults to the hostname.
     * `:capabilities` - list of `Home.Capability` structs or maps. Or `:manifest` - `{:file, path}`.
-    * `:cluster` - `[source: module | {module, opts}, interval: ms]`. Default `Home.Cluster.Epmd`.
+    * `:cluster` - `[backend: module | {module, opts}, interval: ms]`. Default `Home.Cluster.Epmd`.
     * `:data_dir` - where secrets, area and other node state persist.
     * `:media` - `[ip: ip_tuple, ports: first..last]`, the address and UDP range media is received on.
     * `:ha` - `[area_refresh: ms, timeout: ms]`. HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).

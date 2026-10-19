@@ -43,7 +43,7 @@ defmodule HostNode do
           data_dir: data_dir,
           capabilities: capabilities,
           cluster: [
-            source: {Home.Cluster.Static, nodes: [@guest | Enum.map(peers, &name/1)]},
+            backend: {Home.Cluster.Static, nodes: [@guest | Enum.map(peers, &name/1)]},
             interval: 2_000
           ]
         ],
