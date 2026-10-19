@@ -32,6 +32,25 @@ defmodule Home.Test.MediaHelpers do
     end
   end
 
+  @doc "Inputs of the mixer behind a `Home.Adapters.Audio.Mixer` speaker on this node."
+  def mixer_inputs(cap) do
+    {:ok, server} = Home.Registry.whereis(cap)
+    Home.Media.Mixer.inputs(:sys.get_state(server).astate.mixer)
+  end
+
+  @doc """
+  Load every module of the loaded applications, as a release in embedded mode does at
+  boot. Peers load code lazily, and the first packet through a fresh node otherwise pays
+  for loading the RTP/Opus modules, which ends up as permanent playout delay.
+  """
+  def preload do
+    for {app, _, _} <- Application.loaded_applications(),
+        {:ok, mods} = :application.get_key(app, :modules),
+        do: :code.ensure_modules_loaded(mods)
+
+    :ok
+  end
+
   @doc "Media pipelines and sessions currently running on this node."
   def media_children, do: length(DynamicSupervisor.which_children(Home.Media.Supervisor))
 end

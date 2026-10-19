@@ -38,6 +38,7 @@ defmodule Home.MediaSessionTest do
     # Wait until every node sees every capability.
     for n <- [a, b, c] do
       eventually(fn -> length(rpc(n, Home.Registry, :list, [])) == 3 end)
+      rpc(n, MediaHelpers, :preload)
     end
 
     %{a: a, b: b, c: c, bpeer: bpeer}
