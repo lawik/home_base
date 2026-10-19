@@ -17,6 +17,13 @@ defmodule Home.Media.Session do
   If the session can't be set up, `start/1` returns `{:error, reason}`; leases already
   handed over to it are released.
 
+  Sinks can be added to and removed from a running session (`add_sink/2`,
+  `remove_sink/2`): the source keeps its one encoder and gains or loses a destination.
+
+  RTCP runs alongside the RTP (see `Home.Media.RTCP`): sinks report loss and jitter and
+  NACK lost packets, which the source resends; a video sink that lost a frame asks for a
+  keyframe. `stats/1` collects what both ends know.
+
   Video is the same with `codec: :h264` (§5.2, §6.3): the source is a `:video_in` lease
   and the sinks are `:display` leases, whose endpoint (the display's compositor) shows
   the frames on the video element `surface: {render_session, target}` (see
@@ -32,8 +39,16 @@ defmodule Home.Media.Session do
     * `:surface` - for video: `{render_session, target}` the frames are drawn into.
     * `:owner` - the session stops when this process exits. Default: the caller.
     * `:renew_every` - ms between lease renewals, default 30 s.
-    * `:jitter` - receiver jitter buffer in ms, default 40.
+    * `:jitter` - receiver jitter buffer in ms, default 40: how long a sink waits for a
+      missing (NACKed) packet before giving up on it.
     * `:bitrate` - encoder bitrate, default 64 kbps (Opus) or 3 Mbps (H.264, a cap).
+    * `:feedback` - which RTCP feedback sinks send: a subset of `[:nack, :pli]` (default
+      both). Receiver reports are always sent.
+    * `:playout` - audio sinks: playout queue to keep, in ms (default 20; see
+      `Home.Media.Playout`), or `false` to leave the queue alone.
+    * `:route` - `{module, function, args}` called as `apply(module, function,
+      [{ip, port} | args])` for each sink address; the source sends to the address it
+      returns instead (a port forward, or a test's impairment relay).
   """
 
   use GenServer, restart: :temporary
@@ -79,6 +94,44 @@ defmodule Home.Media.Session do
 
   def info(session), do: GenServer.call(session, :info)
 
+  @doc """
+  Add a sink to a running session. The session becomes the holder of `lease` (an
+  `:audio_out` or `:display` lease, like the ones given to `start/1`) and the source
+  starts sending to it; a video sink gets a fresh keyframe.
+  """
+  @spec add_sink(pid(), Lease.t()) :: :ok | {:error, term()}
+  def add_sink(session, %Lease{} = lease),
+    do: GenServer.call(session, {:add_sink, lease}, @call_timeout * 2)
+
+  @doc """
+  Remove a sink (by capability ref or lease) from a running session: the source stops
+  sending to it, its pipeline stops and its lease is released. The last sink can't be
+  removed (`{:error, :last_sink}`); stop the session instead.
+  """
+  @spec remove_sink(pid(), Home.Capability.ref() | Lease.t()) :: :ok | {:error, term()}
+  def remove_sink(session, %Lease{cap: cap}), do: remove_sink(session, cap)
+
+  def remove_sink(session, cap),
+    do: GenServer.call(session, {:remove_sink, cap}, @call_timeout * 2)
+
+  @doc """
+  What both ends know about the session's streams:
+
+      %{source: %{packets: n, octets: n, nacked: n, retransmitted: n,
+                  keyframe_requests: n, keyframes_forced: n,
+                  receivers: %{sink_cap => %{fraction_lost: f, lost: n, jitter_ms: f,
+                                             rtt_ms: f | nil, highest_seq: n}}},
+        sinks: %{sink_cap => %{packets: n, expected: n, lost: n, fraction_lost: f,
+                               jitter_ms: f, nacked: n, recovered: n, duplicates: n,
+                               keyframe_requests: n, playout: %{...}}}}
+
+  `receivers` is what each sink last reported over RTCP; `sinks` is each sink's own
+  count. Both are updated about once a second (empty until the first report). Loss is
+  after retransmission: a NACKed packet that arrived in time counts as `recovered`.
+  """
+  @spec stats(pid()) :: map()
+  def stats(session), do: GenServer.call(session, :stats, @call_timeout)
+
   ## Server
 
   @impl true
@@ -93,9 +146,12 @@ defmodule Home.Media.Session do
           sinks: sinks,
           ssrc: Enum.random(1..0xFFFFFFFF),
           monitors: %{Process.monitor(Keyword.fetch!(opts, :owner)) => :owner},
+          # Every lease the session holds, to renew and release.
           taken: [],
-          pipelines: [],
-          destinations: [],
+          source_cap: nil,
+          source_pipeline: nil,
+          # One per sink, in the order they were added.
+          outputs: [],
           opts: opts
         }
 
@@ -111,8 +167,8 @@ defmodule Home.Media.Session do
   def handle_continue(:setup, state) do
     {reply_to, ref} = state.opts[:reply_to]
 
-    with {:ok, state} <- take_leases(state),
-         {:ok, state} <- start_sinks(state),
+    with {:ok, state} <- take_source(state),
+         {:ok, state} <- add_outputs(state, state.sinks),
          {:ok, state} <- start_source(state) do
       Process.send_after(self(), :renew, renew_every(state))
       send(reply_to, {ref, :ok})
@@ -128,13 +184,61 @@ defmodule Home.Media.Session do
   def handle_call(:info, _from, state) do
     reply = %{
       source: source_ref(state.source),
-      sinks: Enum.map(state.sinks, & &1.cap),
-      destinations: state.destinations,
+      sinks: Enum.map(state.outputs, & &1.cap),
+      destinations: Enum.map(state.outputs, & &1.address),
       ssrc: state.ssrc,
-      pipelines: state.pipelines
+      pipelines: pipelines(state)
     }
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:add_sink, lease}, _from, state) do
+    if Enum.any?(state.outputs, &(&1.cap == lease.cap)) do
+      {:reply, {:error, :already_a_sink}, state}
+    else
+      case add_output(state, lease) do
+        {:ok, state} ->
+          output = List.last(state.outputs)
+
+          case source_call(state, {:add_destination, output.to}) do
+            :ok -> {:reply, :ok, state}
+            error -> {:reply, error, drop_output(state, output)}
+          end
+
+        {:error, reason, state} ->
+          {:reply, {:error, reason}, state}
+      end
+    end
+  end
+
+  def handle_call({:remove_sink, cap}, _from, state) do
+    case Enum.find(state.outputs, &(&1.cap == cap)) do
+      nil ->
+        {:reply, {:error, :not_a_sink}, state}
+
+      _output when length(state.outputs) == 1 ->
+        {:reply, {:error, :last_sink}, state}
+
+      output ->
+        # Stop sending first, so nothing goes to a closed port.
+        _ = source_call(state, {:remove_destination, output.to})
+        {:reply, :ok, drop_output(state, output)}
+    end
+  end
+
+  def handle_call(:stats, _from, state) do
+    source = pipeline_call(state.source_pipeline, :stats) || %{}
+    by_address = Map.new(state.outputs, &{&1.to, &1.cap})
+
+    receivers =
+      for {to, report} <- Map.get(source, :receivers, %{}),
+          cap = by_address[to],
+          into: %{},
+          do: {cap, report}
+
+    sinks = Map.new(state.outputs, &{&1.cap, pipeline_call(&1.pipeline, :stats) || %{}})
+    {:reply, %{source: Map.put(source, :receivers, receivers), sinks: sinks}, state}
   end
 
   @impl true
@@ -169,16 +273,8 @@ defmodule Home.Media.Session do
   def terminate(reason, state) do
     unless reason == :normal, do: Logger.info("media session ended: #{inspect(reason)}")
 
-    # Source first (it was started last) so the mic stops producing, then the sinks, then
-    # the leases.
-    for {_cap, pipeline} <- state.pipelines do
-      try do
-        Membrane.Pipeline.terminate(pipeline, force?: true, timeout: 2_000)
-      catch
-        _, _ -> :ok
-      end
-    end
-
+    # Source first so the mic stops producing, then the sinks, then the leases.
+    Enum.each(pipelines(state), fn {_cap, pipeline} -> terminate_pipeline(pipeline) end)
     Enum.each(state.taken, &Lease.release/1)
   end
 
@@ -192,30 +288,41 @@ defmodule Home.Media.Session do
     end
   end
 
-  defp take_leases(state) do
-    leases =
-      if match?(%Lease{}, state.source), do: [state.source | state.sinks], else: state.sinks
+  defp take_source(%{source: %Lease{} = lease} = state) do
+    case take(state, lease) do
+      {:ok, state, _lease, _mref} -> {:ok, state}
+      {:error, reason, state} -> {:error, reason, state}
+    end
+  end
 
-    Enum.reduce_while(leases, {:ok, state}, fn lease, {:ok, state} ->
-      case Lease.handover(lease, self()) do
-        {:ok, lease} ->
-          monitors =
-            Map.put(state.monitors, Process.monitor(lease.server), {:capability, lease.cap})
+  defp take_source(state), do: {:ok, state}
 
-          {:cont, {:ok, %{state | taken: state.taken ++ [lease], monitors: monitors}}}
+  defp take(state, lease) do
+    case Lease.handover(lease, self()) do
+      {:ok, lease} ->
+        mref = Process.monitor(lease.server)
+        monitors = Map.put(state.monitors, mref, {:capability, lease.cap})
+        {:ok, %{state | taken: state.taken ++ [lease], monitors: monitors}, lease, mref}
 
-        {:error, reason} ->
-          {:halt, {:error, {reason, lease.cap}, state}}
-      end
-    end)
+      {:error, reason} ->
+        {:error, {reason, lease.cap}, state}
+    end
   catch
     :exit, reason -> {:error, {:handover_failed, reason}, state}
   end
 
-  defp start_sinks(state) do
-    sinks = if match?(%Lease{}, state.source), do: tl(state.taken), else: state.taken
+  defp add_outputs(state, leases) do
+    Enum.reduce_while(leases, {:ok, state}, fn lease, {:ok, state} ->
+      case add_output(state, lease) do
+        {:ok, state} -> {:cont, {:ok, state}}
+        error -> {:halt, error}
+      end
+    end)
+  end
 
-    Enum.reduce_while(sinks, {:ok, state}, fn lease, {:ok, state} ->
+  # Take the lease, start the sink's pipeline on its node and remember where to send.
+  defp add_output(state, lease) do
+    with {:ok, state, lease, cap_mref} <- take(state, lease) do
       opts =
         Map.merge(media_opts(state), %{
           ssrc: state.ssrc,
@@ -226,21 +333,63 @@ defmodule Home.Media.Session do
 
       case remote(lease, :start_sink, [lease.endpoint, opts]) do
         {:ok, pipeline, {ip, port, _ssrc}} ->
-          state = add_pipeline(state, lease, pipeline)
-          {:cont, {:ok, %{state | destinations: state.destinations ++ [{ip, port}]}}}
+          mref = Process.monitor(pipeline)
+
+          output = %{
+            cap: lease.cap,
+            lease: lease,
+            pipeline: pipeline,
+            address: {ip, port},
+            to: route(state, {ip, port}),
+            mrefs: [cap_mref, mref]
+          }
+
+          monitors = Map.put(state.monitors, mref, {:pipeline, lease.cap})
+          {:ok, %{state | outputs: state.outputs ++ [output], monitors: monitors}}
 
         {:error, reason} ->
-          {:halt, {:error, {:sink_failed, lease.cap, reason}, state}}
+          Process.demonitor(cap_mref, [:flush])
+          release(lease)
+
+          state = %{
+            state
+            | taken: Enum.reject(state.taken, &(&1.ref == lease.ref)),
+              monitors: Map.delete(state.monitors, cap_mref)
+          }
+
+          {:error, {:sink_failed, lease.cap, reason}, state}
       end
-    end)
+    end
   end
+
+  defp drop_output(state, output) do
+    Enum.each(output.mrefs, &Process.demonitor(&1, [:flush]))
+    terminate_pipeline(output.pipeline)
+    release(output.lease)
+
+    %{
+      state
+      | outputs: List.delete(state.outputs, output),
+        taken: Enum.reject(state.taken, &(&1.ref == output.lease.ref)),
+        monitors: Map.drop(state.monitors, output.mrefs)
+    }
+  end
+
+  defp route(state, address) do
+    case Keyword.get(state.opts, :route) do
+      {m, f, a} -> apply(m, f, [address | a])
+      nil -> address
+    end
+  end
+
+  defp destinations(state), do: Enum.map(state.outputs, & &1.to)
 
   defp start_source(%{source: %Lease{}} = state) do
     [lease | _sinks] = state.taken
     opts = Map.merge(media_opts(state), %{ssrc: state.ssrc, session: self(), cap: lease.cap})
 
-    case remote(lease, :start_source, [lease.endpoint, state.destinations, opts]) do
-      {:ok, pipeline} -> {:ok, add_pipeline(state, lease, pipeline)}
+    case remote(lease, :start_source, [lease.endpoint, destinations(state), opts]) do
+      {:ok, pipeline} -> {:ok, add_source_pipeline(state, lease.cap, pipeline)}
       {:error, reason} -> {:error, {:source_failed, lease.cap, reason}, state}
     end
   end
@@ -249,30 +398,57 @@ defmodule Home.Media.Session do
   defp start_source(state) do
     opts = Map.merge(media_opts(state), %{ssrc: state.ssrc, session: self(), cap: nil})
 
-    case Home.Media.start_source(state.source, state.destinations, opts) do
-      {:ok, pipeline} -> {:ok, add_pipeline(state, %{cap: {node(), :local}}, pipeline)}
+    case Home.Media.start_source(state.source, destinations(state), opts) do
+      {:ok, pipeline} -> {:ok, add_source_pipeline(state, {node(), :local}, pipeline)}
       {:error, reason} -> {:error, {:source_failed, :local, reason}, state}
     end
   end
 
+  defp add_source_pipeline(state, cap, pipeline) do
+    monitors = Map.put(state.monitors, Process.monitor(pipeline), {:pipeline, cap})
+    %{state | monitors: monitors, source_pipeline: pipeline, source_cap: cap}
+  end
+
+  # Source first.
+  defp pipelines(state) do
+    sinks = for o <- Enum.reverse(state.outputs), do: {o.cap, o.pipeline}
+    if state.source_pipeline, do: [{state.source_cap, state.source_pipeline} | sinks], else: sinks
+  end
+
   defp media_opts(state) do
     state.opts
-    |> Keyword.take([:codec, :bitrate, :surface, :gop_size])
+    |> Keyword.take([:codec, :bitrate, :surface, :gop_size, :feedback, :playout])
     |> Map.new()
   end
 
   defp source_ref(%Lease{cap: cap}), do: cap
   defp source_ref(_element), do: {node(), :local}
 
+  defp source_call(state, msg) do
+    case pipeline_call(state.source_pipeline, msg) do
+      nil -> {:error, :source_unreachable}
+      reply -> reply
+    end
+  end
+
+  defp pipeline_call(nil, _msg), do: nil
+
+  defp pipeline_call(pipeline, msg) do
+    Membrane.Pipeline.call(pipeline, msg, 5_000)
+  catch
+    :exit, _ -> nil
+  end
+
+  defp terminate_pipeline(pipeline) do
+    Membrane.Pipeline.terminate(pipeline, force?: true, timeout: 2_000)
+  catch
+    _, _ -> :ok
+  end
+
   defp remote(lease, fun, args) do
     :erpc.call(node(lease.server), Home.Media, fun, args, @call_timeout)
   catch
     kind, reason -> {:error, {kind, reason}}
-  end
-
-  defp add_pipeline(state, lease, pipeline) do
-    monitors = Map.put(state.monitors, Process.monitor(pipeline), {:pipeline, lease.cap})
-    %{state | monitors: monitors, pipelines: [{lease.cap, pipeline} | state.pipelines]}
   end
 
   defp renew_every(state), do: Keyword.get(state.opts, :renew_every, 30_000)
@@ -281,5 +457,11 @@ defmodule Home.Media.Session do
     Lease.renew(lease)
   catch
     :exit, _ -> {:error, :gone}
+  end
+
+  defp release(lease) do
+    Lease.release(lease)
+  catch
+    :exit, _ -> :ok
   end
 end

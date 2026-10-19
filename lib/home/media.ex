@@ -31,7 +31,9 @@ defmodule Home.Media do
   Returns `{:ok, pipeline, {ip, port, ssrc}}`.
 
   Options: `:ssrc`, `:session`, `:cap`, `:codec` (`:opus` or `:h264`), `:kind` (`:audio_out`,
-  or `:display` for video), `:jitter` (ms, 40).
+  or `:display` for video), `:jitter` (ms, 40), `:feedback` (RTCP feedback to send, a
+  subset of `[:nack, :pli]`, both by default), `:playout` (audio: playout queue to keep in
+  ms, 20, or `false`; see `Home.Media.Playout`).
 
   For video, `endpoint` may be a display's `Home.Render.Compositor`; frames then go to
   the video element `target` of render session `owner` given as `surface: {owner, target}`

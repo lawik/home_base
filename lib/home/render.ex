@@ -47,7 +47,8 @@ defmodule Home.Render do
   pid; `stop/1` stops it, and it stops by itself when either side goes away.
 
   Options: `:on` (required), `:purpose`, `:bitrate` (H.264 cap, default 3 Mbps),
-  `:gop_size`, `:jitter`, `:input_to` (a pid that gets the display's input events).
+  `:gop_size`, `:jitter`, `:feedback`, `:route` (see `Home.Media.Session`), `:input_to` (a
+  pid that gets the display's input events).
   """
   @spec show_video(Home.Lease.t() | Home.Capability.ref(), keyword()) ::
           {:ok, pid()} | {:error, term()}
@@ -86,7 +87,11 @@ defmodule Home.Render do
     )
   end
 
-  @doc "Draw the session's app on another display. The app keeps running."
+  @doc """
+  Draw the session's app on another display. The app keeps running. For a video
+  (`show_video/2`, `show_pixels/2`) the new display joins the media session and the old
+  one leaves it; a pixel app keeps rendering at the first display's size.
+  """
   @spec move(pid(), keyword()) :: :ok | {:error, term()}
   def move(session, to: target), do: Home.Render.Session.move(session, target)
 

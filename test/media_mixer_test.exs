@@ -79,6 +79,37 @@ defmodule Home.MediaMixerTest do
     eventually(fn -> mixer_inputs(b) == 0 end)
   end
 
+  test "the mixer pipeline dies: it starts again and the session plays on", ctx do
+    %{a: a, b: b} = ctx
+    me = self()
+    spk = {b, "spk0"}
+    {:ok, server} = rpc(b, Home.Registry, :whereis, [spk])
+
+    one = Node.spawn(a, MediaHelpers, :intercom, [me, {a, "mic0"}, spk])
+    assert_receive {:session, ^one, {:ok, session}}, 10_000
+    assert length(latencies({a, "mic0"}, spk, 1_500)) >= 2
+    mixer = rpc(b, MediaHelpers, :mixer, [spk])
+
+    Process.exit(mixer, :kill)
+    eventually(fn -> rpc(b, MediaHelpers, :mixer, [spk]) not in [nil, mixer] end)
+    eventually(fn -> mixer_inputs(b) == 1 end)
+
+    flush()
+    lat = latencies({a, "mic0"}, spk, 2_000)
+    report("A -> B via a restarted mixer", lat)
+    assert length(lat) >= 4
+    assert p95(lat) <= 150
+
+    # Nothing else noticed: same capability server, same lease, same session.
+    assert {:ok, ^server} = rpc(b, Home.Registry, :whereis, [spk])
+    assert [%{leases: 1}] = rpc(a, Home.Registry, :list, [[kind: :audio_out]])
+    assert rpc(a, Process, :alive?, [session])
+    refute_received {:session_down, ^one, _}
+
+    send(one, :stop)
+    assert_receive {:stopped, ^one}
+  end
+
   defp mixer_inputs(node) do
     rpc(node, MediaHelpers, :mixer_inputs, [{node, "spk0"}])
   end
