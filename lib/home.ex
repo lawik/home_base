@@ -23,6 +23,8 @@ defmodule Home do
       HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).
     * `:watchdog_interval` - lease watchdog sweep interval in ms.
     * `:activity` - `[ring: n]`, how many recent events to keep per capability and kind (64).
+    * `:onvif` - `[discover_every: ms, discover: opts]`: periodic ONVIF discovery, off by
+      default (see `Home.Onvif`).
   """
 
   use Supervisor
@@ -67,9 +69,13 @@ defmodule Home do
         type: :supervisor,
         start: {Supervisor, :start_link, [capabilities, [strategy: :one_for_one]]}
       },
+      # Capabilities added at runtime (`Home.Capability.add/1`), e.g. ONVIF cameras.
+      {DynamicSupervisor, name: Home.Capability.Runtime, strategy: :one_for_one},
       {Home.Lease.Watchdog, interval: Keyword.get(opts, :watchdog_interval, 1_000)},
       {DynamicSupervisor, name: Home.Media.Supervisor, strategy: :one_for_one},
       {DynamicSupervisor, name: Home.Render.Supervisor, strategy: :one_for_one},
+      # ONVIF cameras configured on this node, re-added as runtime capabilities at boot.
+      {Home.Onvif, Keyword.get(opts, :onvif, [])},
       {Home.Cluster, Keyword.get(opts, :cluster, [])}
     ]
 

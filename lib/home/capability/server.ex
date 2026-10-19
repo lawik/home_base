@@ -26,6 +26,14 @@ defmodule Home.Capability.Server do
   """
   def info(pid, timeout \\ 5_000), do: GenServer.call(pid, :info, timeout)
 
+  @doc false
+  # `Home.Capability.remove/1`: revoke every lease, turn the hardware off, stop.
+  def remove(pid) do
+    GenServer.call(pid, :remove)
+  catch
+    :exit, _ -> :ok
+  end
+
   def local_servers do
     Capability.kinds()
     |> Enum.flat_map(&:pg.get_local_members(@scope, {:capability, &1}))
@@ -137,13 +145,12 @@ defmodule Home.Capability.Server do
   end
 
   def handle_call(:revoke_all, _from, state) do
-    state =
-      Enum.reduce(Map.keys(state.leases), state, fn ref, state ->
-        send(state.leases[ref].lease.holder, {:lease_revoked, ref})
-        drop(state, ref, :revoked)
-      end)
+    {:reply, :ok, revoke_all(state)}
+  end
 
-    {:reply, :ok, state}
+  def handle_call(:remove, _from, state) do
+    state = state |> revoke_all() |> hardware_off()
+    {:stop, :normal, :ok, state}
   end
 
   @impl true
@@ -175,6 +182,13 @@ defmodule Home.Capability.Server do
   defp adapter(%Capability{adapter: {mod, opts}}), do: {mod, opts}
   defp adapter(%Capability{adapter: nil}), do: {Home.Adapters.Null, []}
   defp adapter(%Capability{adapter: mod}), do: {mod, []}
+
+  defp revoke_all(state) do
+    Enum.reduce(Map.keys(state.leases), state, fn ref, state ->
+      send(state.leases[ref].lease.holder, {:lease_revoked, ref})
+      drop(state, ref, :revoked)
+    end)
+  end
 
   defp drop(state, ref, event) do
     case Map.pop(state.leases, ref) do

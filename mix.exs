@@ -44,6 +44,9 @@ defmodule HomeBase.MixProject do
       {:solve, "~> 0.3.1"},
       {:membrane_portaudio_plugin, "~> 0.19"},
       {:membrane_audio_mix_plugin, "~> 0.16"},
+      # ONVIF cameras (Home.Onvif): SOAP device/media services, RTSP client.
+      {:ex_onvif, "~> 0.9"},
+      {:rtsp, "~> 0.8"},
       {:bandit, "~> 1.5", only: :test},
       {:websock_adapter, "~> 0.5", only: :test}
     ]
