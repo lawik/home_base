@@ -8,6 +8,11 @@ defmodule Home.Media.SourcePipeline do
 
       endpoint -> to I420 -> H.264 encoder -> H.264 parser (NAL units) -> RTP H.264 payloader -> RTP muxer -> ...
 
+  or, when the endpoint is already-encoded H.264 (a `Home.Media.H264Relay`, e.g. an IP
+  camera's stream), without decoding or re-encoding:
+
+      endpoint -> H.264 parser (NAL units) -> RTP H.264 payloader -> RTP muxer -> ...
+
   One encoder and one payloader however many sinks (§5.3). Terminates when the session dies.
   """
 
@@ -35,6 +40,12 @@ defmodule Home.Media.SourcePipeline do
         end
 
     {[spec: spec], opts}
+  end
+
+  defp encode(endpoint, %{codec: :h264, endpoint: %Home.Media.H264Relay{}}) do
+    endpoint
+    |> child(:parser, %Membrane.H264.Parser{output_alignment: :nalu, repeat_parameter_sets: true})
+    |> child(:payloader, Membrane.RTP.H264.Payloader)
   end
 
   defp encode(endpoint, %{codec: :h264} = opts) do
