@@ -341,7 +341,7 @@ There is no consent dialog. The rule is simply: hardware that was off goes back 
 
 - Holder death (process exit, node down) releases immediately via monitor; the watchdog is the backstop for a holder that is alive but stuck.
 
-- A node-local Home.Lease.revoke_all/0 drops every lease on this node and stops its hardware. Expose it as a function and, where there is a UI, a button or hotkey; no confirmation.
+- A node-local Home.Lease.revoke_all/0 drops every lease on this node and stops its :on_request hardware (:always hardware stays on; nothing would turn it back on). Expose it as a function and, where there is a UI, a button or hotkey; no confirmation.
 
 - Lease state and hardware on/off are broadcast on PubSub "leases" so any display can show a small "mic on, held by " indicator. That indicator is the entire transparency story for now.
 
