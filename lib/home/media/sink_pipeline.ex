@@ -2,14 +2,24 @@ defmodule Home.Media.SinkPipeline do
   @moduledoc """
   Sink side of a session, on the sink capability's node:
 
-      UDP source -> RTP demuxer (jitter buffer) -> RTP Opus depayloader -> Opus decoder -> level -> endpoint
+      UDP endpoint -> RTCP receiver -> RTP demuxer (jitter buffer) -> RTP Opus depayloader
+        -> Opus decoder -> level -> playout -> endpoint
 
   or, for `codec: :h264`,
 
-      ... -> RTP H.264 depayloader -> H.264 parser (access units) -> H.264 decoder -> to RGB -> endpoint
+      ... -> RTP H.264 depayloader (access units, on the RTP marker) -> H.264 parser
+        -> H.264 decoder -> to RGB -> endpoint
 
-  Sends `{:media_ready, self()}` to `reply_to` once the UDP socket is open, and terminates
-  when the session dies.
+  The RTCP receiver's feedback (receiver reports, NACKs, PLIs) goes back out of the same
+  UDP endpoint to wherever the RTP comes from (see `Home.Media.RTCP`). After a loss the
+  video freezes until a keyframe and a PLI asks for one (`Home.Media.H264Depayloader`);
+  audio's playout queue is kept short by `Home.Media.Playout`.
+
+  Options beyond `Home.Media.start_sink/2`'s: `:feedback` (subset of `[:nack, :pli]`,
+  both by default), `:playout` (target queue in ms, or `false` for none).
+
+  Sends `{:media_ready, self()}` to `reply_to` once the UDP socket is open, answers
+  `Membrane.Pipeline.call(pipeline, :stats)`, and terminates when the session dies.
   """
 
   use Membrane.Pipeline
@@ -17,9 +27,23 @@ defmodule Home.Media.SinkPipeline do
   @impl true
   def handle_init(_ctx, opts) do
     Process.monitor(opts.session)
+    opts = opts |> Map.put_new(:feedback, [:nack, :pli]) |> Map.put_new(:playout, 20)
 
-    spec =
-      child(:udp, %Membrane.UDP.Source{local_port_no: opts.port, local_address: opts.ip})
+    spec = [
+      # The destination is only a placeholder: feedback goes back to the RTP's sender
+      # (`latch?`), and nothing is sent before the first RTP packet.
+      child(:udp, %Membrane.UDP.Endpoint{
+        local_port_no: opts.port,
+        local_address: opts.ip,
+        destination_address: opts.ip,
+        destination_port_no: opts.port,
+        latch?: true
+      })
+      |> child(:rtcp, %Home.Media.RTCP.Receiver{
+        ssrc: opts.ssrc,
+        clock_rate: if(opts.codec == :h264, do: 90_000, else: 48_000),
+        nack: :nack in opts.feedback
+      })
       |> child(:demuxer, Membrane.RTP.Demuxer)
       |> via_out(:output,
         options: [
@@ -28,14 +52,16 @@ defmodule Home.Media.SinkPipeline do
         ]
       )
       |> decode(opts)
-      |> child(:endpoint, opts.endpoint)
+      |> child(:endpoint, opts.endpoint),
+      get_child(:rtcp) |> via_out(:feedback) |> get_child(:udp)
+    ]
 
-    {[spec: spec], opts}
+    {[spec: spec], Map.merge(opts, %{rtp: %{}, playout_stats: nil})}
   end
 
   defp decode(demuxer, %{codec: :h264}) do
     demuxer
-    |> child(:depayloader, Membrane.RTP.H264.Depayloader)
+    |> child(:depayloader, Home.Media.H264Depayloader)
     |> child(:parser, Membrane.H264.Parser)
     |> child(:decoder, Membrane.H264.FFmpeg.Decoder)
     |> child(:to_rgb, %Membrane.FFmpeg.SWScale.Converter{format: :RGB})
@@ -46,28 +72,54 @@ defmodule Home.Media.SinkPipeline do
     |> child(:depayloader, Membrane.RTP.Opus.Depayloader)
     |> child(:decoder, Membrane.Opus.Decoder)
     |> child(:level, %Home.Media.Level{cap: opts.cap, kind: opts.kind, session: opts.session})
+    |> playout(opts)
   end
+
+  defp playout(audio, %{playout: false}), do: audio
+  defp playout(audio, %{playout: ms}), do: child(audio, :playout, %Home.Media.Playout{target: ms})
 
   @impl true
   # A display's activity (session started/stopped, frames) comes from its compositor.
-  def handle_setup(_ctx, %{codec: :h264} = opts), do: {[], opts}
+  def handle_setup(_ctx, %{codec: :h264} = state), do: {[], state}
 
-  def handle_setup(ctx, opts) do
-    Home.Media.announce_stream(ctx.resource_guard, opts.cap, opts.kind, opts.session)
-    {[], opts}
+  def handle_setup(ctx, state) do
+    Home.Media.announce_stream(ctx.resource_guard, state.cap, state.kind, state.session)
+    {[], state}
   end
 
   @impl true
-  def handle_child_notification({:connection_info, _ip, _port}, :udp, _ctx, opts) do
-    send(opts.reply_to, {:media_ready, self()})
-    {[], opts}
+  def handle_child_notification({:connection_info, _ip, _port}, :udp, _ctx, state) do
+    send(state.reply_to, {:media_ready, self()})
+    {[], state}
   end
 
-  def handle_child_notification(_msg, _child, _ctx, opts), do: {[], opts}
+  def handle_child_notification(:keyframe_request, :depayloader, _ctx, state) do
+    if :pli in state.feedback,
+      do: {[notify_child: {:rtcp, :keyframe_request}], state},
+      else: {[], state}
+  end
+
+  def handle_child_notification({:receiver_stats, stats}, :rtcp, _ctx, state),
+    do: {[], %{state | rtp: stats}}
+
+  def handle_child_notification({:playout, stats}, :playout, _ctx, state),
+    do: {[], %{state | playout_stats: stats}}
+
+  def handle_child_notification(_msg, _child, _ctx, state), do: {[], state}
 
   @impl true
-  def handle_info({:DOWN, _, :process, pid, _}, _ctx, %{session: pid} = opts),
-    do: {[terminate: :normal], opts}
+  def handle_call(:stats, _ctx, state) do
+    stats =
+      if state.playout_stats,
+        do: Map.put(state.rtp, :playout, state.playout_stats),
+        else: state.rtp
 
-  def handle_info(_msg, _ctx, opts), do: {[], opts}
+    {[reply: stats], state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _, :process, pid, _}, _ctx, %{session: pid} = state),
+    do: {[terminate: :normal], state}
+
+  def handle_info(_msg, _ctx, state), do: {[], state}
 end
