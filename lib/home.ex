@@ -63,6 +63,7 @@ defmodule Home do
       },
       {Home.Lease.Watchdog, interval: Keyword.get(opts, :watchdog_interval, 1_000)},
       {DynamicSupervisor, name: Home.Media.Supervisor, strategy: :one_for_one},
+      {DynamicSupervisor, name: Home.Render.Supervisor, strategy: :one_for_one},
       {Home.Cluster, Keyword.get(opts, :cluster, [])}
     ]
 

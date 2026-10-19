@@ -1,0 +1,342 @@
+defmodule Home.Render.Compositor do
+  @moduledoc """
+  Draws remote render sessions on this node's display with the local emerge renderer.
+
+  Started by `Home.Adapters.Display`; it is the display capability's lease endpoint.
+  A `Home.Render.Session` on another node sends the assets its app uses, attaches, then
+  sends the encoded tree (`EmergeSkia.upload_tree_binary/2`) and patches
+  (`EmergeSkia.patch_tree_binary/2`). The session keeps emerge's diff state; this
+  process only applies bytes. Native input goes back to the session that is shown.
+
+  Sessions stack in attach order, latest on top. Only the top one is drawn: emerge has
+  one tree per renderer, so a session that becomes top gets a fresh renderer (with its
+  own fonts and asset directory) and is asked for a full tree.
+
+  Assets are cached on disk under `<data_dir>/render/assets/<sha256>`; each session
+  gets a directory of its logical paths linked into that cache, which is the
+  renderer's `assets.sources`.
+  """
+
+  use GenServer
+  require Logger
+
+  alias Home.Activity
+
+  defstruct [
+    :cap,
+    :config,
+    :dir,
+    :renderer,
+    :frame,
+    sessions: %{},
+    stack: [],
+    synced?: false
+  ]
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  ## Session side
+
+  @doc "Put `session` on top. Its fonts must already be sent with `put_asset/5`."
+  def attach(comp, session, view), do: GenServer.call(comp, {:attach, session, view}, 15_000)
+
+  def detach(comp, session), do: GenServer.call(comp, {:detach, session})
+
+  @doc "Of `[{logical_path, hash}]`, the hashes this node lacks. Known ones are linked in."
+  def missing(comp, session, entries), do: GenServer.call(comp, {:missing, session, entries})
+
+  def put_asset(comp, session, logical, hash, data),
+    do: send(comp, {:asset, session, logical, hash, data})
+
+  def upload(comp, session, bin), do: send(comp, {:upload, session, bin})
+  def patch(comp, session, bin), do: send(comp, {:patch, session, bin})
+  def configure(comp, session, view), do: send(comp, {:configure, session, view})
+
+  ## Display side
+
+  @doc "Feed a native-shaped input event, as if it came from the renderer."
+  def input(comp, event) do
+    send(comp, {:emerge_skia_event, event})
+    :ok
+  end
+
+  @doc "The session drawn now, or nil."
+  def shown(comp), do: GenServer.call(comp, :shown)
+
+  @doc "The latest frame of a headless output (`%VideoInterop.Frame{}`), or nil."
+  def frame(comp), do: GenServer.call(comp, :frame)
+
+  @doc "Pixels of the latest presented frame, see `EmergeSkia.render_to_pixels/2`."
+  def capture(comp, opts), do: GenServer.call(comp, {:capture, opts})
+
+  ## Server
+
+  @impl true
+  def init(opts) do
+    dir = Path.join(Home.data_dir(), "render")
+    File.mkdir_p!(Path.join(dir, "assets"))
+    File.rm_rf!(Path.join(dir, "sessions"))
+
+    {:ok,
+     %__MODULE__{cap: Keyword.fetch!(opts, :cap), config: Keyword.fetch!(opts, :config), dir: dir}}
+  end
+
+  @impl true
+  def handle_call({:attach, pid, view}, _from, state) do
+    {_entry, state} = entry(state, pid)
+    state = put_in(state.sessions[pid].view, view)
+    if pid not in state.stack, do: emit(state, :session_started, pid)
+    state = %{state | stack: [pid | List.delete(state.stack, pid)]}
+    {:reply, :ok, show_top(state, false)}
+  end
+
+  def handle_call({:detach, pid}, _from, state), do: {:reply, :ok, drop(state, pid)}
+
+  def handle_call({:missing, pid, entries}, _from, state) do
+    {entry, state} = entry(state, pid)
+
+    {present, absent} =
+      entries
+      |> Enum.filter(fn {logical, _} -> safe_logical?(logical) end)
+      |> Enum.split_with(fn {_, hash} -> File.regular?(cache_path(state, hash)) end)
+
+    Enum.each(present, fn {logical, hash} -> link(state, entry, logical, hash) end)
+    {:reply, absent |> Enum.map(&elem(&1, 1)) |> Enum.uniq(), state}
+  end
+
+  def handle_call(:shown, _from, state), do: {:reply, top(state), state}
+  def handle_call(:frame, _from, state), do: {:reply, state.frame, state}
+
+  def handle_call({:capture, _opts}, _from, %{renderer: nil} = state),
+    do: {:reply, {:error, :not_rendering}, state}
+
+  def handle_call({:capture, opts}, _from, state),
+    do: {:reply, EmergeSkia.render_to_pixels(state.renderer, opts), state}
+
+  @impl true
+  def handle_info({:asset, pid, logical, hash, data}, state) do
+    with %{} = entry <- state.sessions[pid],
+         true <- safe_logical?(logical),
+         ^hash <- hash(data) do
+      path = cache_path(state, hash)
+      tmp = path <> ".tmp#{System.unique_integer([:positive])}"
+      File.write!(tmp, data)
+      File.rename!(tmp, path)
+      link(state, entry, logical, hash)
+    else
+      _ -> Logger.warning("render: dropped asset #{inspect(logical)} from #{inspect(pid)}")
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:upload, pid, bin}, state) do
+    if top(state) == pid and state.renderer != nil do
+      case EmergeSkia.upload_tree_binary(state.renderer, bin) do
+        :ok -> {:noreply, %{state | synced?: true}}
+        error -> {:noreply, log_error(state, :upload, error)}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
+  # Patches are relative to the session's last full tree; until this renderer has one
+  # (after a resync request), they are dropped.
+  def handle_info({:patch, pid, bin}, state) do
+    if top(state) == pid and state.renderer != nil and state.synced? do
+      case EmergeSkia.patch_tree_binary(state.renderer, bin) do
+        :ok -> {:noreply, state}
+        error -> {:noreply, log_error(state, :patch, error)}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:configure, pid, view}, state) do
+    case state.sessions do
+      %{^pid => entry} ->
+        updated = %{entry | view: view}
+
+        if top(state) == pid and state.renderer != nil do
+          previous = renderer_config(state, entry)
+          _ = EmergeSkia.configure(state.renderer, previous, renderer_config(state, updated))
+        end
+
+        {:noreply, put_in(state.sessions[pid], updated)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:emerge_skia_event, event}, state) do
+    if pid = top(state) do
+      send(pid, {:home_render_input, self(), event})
+      Activity.emit(state.cap, :input, input_kind(event), %{session: pid})
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:emerge_skia_close, reason}, state) do
+    if pid = top(state), do: send(pid, {:home_render_close, self(), reason})
+    {:noreply, state}
+  end
+
+  def handle_info({:emerge_skia_frame, frame}, state) do
+    Activity.emit(state.cap, :display, :frame, %{session: top(state), fps: nil})
+    {:noreply, %{state | frame: frame}}
+  end
+
+  def handle_info({:emerge_skia_log, level, source, message}, state) do
+    if level in [:warning, :error], do: Logger.log(level, "render: emerge #{source}: #{message}")
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state), do: {:noreply, drop(state, pid)}
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    stop_renderer(state)
+    :ok
+  end
+
+  ## Internals
+
+  defp top(%{stack: [pid | _]}), do: pid
+  defp top(_), do: nil
+
+  # A session is known from its first asset offer; it is drawn once attached.
+  defp entry(state, pid) do
+    case state.sessions do
+      %{^pid => entry} ->
+        {entry, state}
+
+      _ ->
+        dir =
+          Path.join([
+            state.dir,
+            "sessions",
+            Integer.to_string(System.unique_integer([:positive]))
+          ])
+
+        File.mkdir_p!(dir)
+        entry = %{monitor: Process.monitor(pid), view: %{}, dir: dir}
+        {entry, put_in(state.sessions[pid], entry)}
+    end
+  end
+
+  defp drop(state, pid) do
+    case Map.pop(state.sessions, pid) do
+      {nil, _} ->
+        state
+
+      {entry, sessions} ->
+        Process.demonitor(entry.monitor, [:flush])
+        File.rm_rf(entry.dir)
+        was_top? = top(state) == pid
+        if pid in state.stack, do: emit(state, :session_stopped, pid)
+        state = %{state | sessions: sessions, stack: List.delete(state.stack, pid)}
+        if was_top?, do: show_top(state, true), else: state
+    end
+  end
+
+  # (Re)start the renderer for the top session. `resync?` asks that session for a full
+  # tree; a freshly attached session sends one on its own after `attach/3` returns.
+  defp show_top(state, resync?) do
+    state = stop_renderer(state)
+
+    case state.stack do
+      [] ->
+        emit(state, :blank, nil)
+        %{state | frame: nil}
+
+      [pid | _] ->
+        case EmergeSkia.start(renderer_config(state, state.sessions[pid])) do
+          {:ok, renderer} ->
+            :ok = EmergeSkia.set_input_target(renderer, self())
+            :ok = EmergeSkia.set_log_target(renderer, self())
+            if resync?, do: send(pid, {:home_render_resync, self()})
+            %{state | renderer: renderer, synced?: false}
+
+          {:error, reason} ->
+            Logger.error("render: renderer start failed: #{inspect(reason)}")
+            state
+        end
+    end
+  rescue
+    error ->
+      Logger.error("render: renderer start failed: #{Exception.message(error)}")
+      %{state | renderer: nil, synced?: false}
+  end
+
+  defp stop_renderer(%{renderer: nil} = state), do: state
+
+  defp stop_renderer(state) do
+    _ = EmergeSkia.stop(state.renderer)
+    %{state | renderer: nil, synced?: false}
+  catch
+    _, _ -> %{state | renderer: nil, synced?: false}
+  end
+
+  # The display's own output and renderer settings; the session's fonts, input
+  # subscriptions and assets.
+  defp renderer_config(state, entry) do
+    %Emerge.Config{} = config = state.config
+    view = entry.view
+
+    output =
+      case config.output do
+        %Emerge.Config.Headless{} = headless -> %{headless | target: self()}
+        other -> other
+      end
+
+    %Emerge.Config{
+      config
+      | output: output,
+        input: Map.get(view, :input, config.input),
+        assets: %Emerge.Config.Assets{
+          otp_app: :home_base,
+          sources: [entry.dir],
+          fonts: Map.get(view, :fonts, [])
+        }
+    }
+  end
+
+  defp link(state, entry, logical, hash) do
+    dest = Path.join(entry.dir, logical)
+    File.mkdir_p!(Path.dirname(dest))
+    File.rm(dest)
+
+    with {:error, _} <- File.ln(cache_path(state, hash), dest),
+         do: File.cp!(cache_path(state, hash), dest)
+  end
+
+  defp cache_path(state, hash), do: Path.join([state.dir, "assets", hash])
+
+  defp safe_logical?(logical) when is_binary(logical) do
+    logical != "" and Path.type(logical) == :relative and ".." not in Path.split(logical)
+  end
+
+  defp safe_logical?(_), do: false
+
+  @doc false
+  def hash(data), do: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
+
+  defp emit(state, event, pid), do: Activity.emit(state.cap, :display, event, %{session: pid})
+
+  defp input_kind({_id, event, _}) when event in [:key_down, :key_up, :key_press], do: :key
+  defp input_kind({_id, :scroll, _}), do: :scroll
+  defp input_kind({:key, _}), do: :key
+  defp input_kind({:cursor_scroll, _}), do: :scroll
+  defp input_kind(_), do: :pointer
+
+  defp log_error(state, what, error) do
+    Logger.warning("render: #{what} failed: #{inspect(error)}")
+    state
+  end
+end
