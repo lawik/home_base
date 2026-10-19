@@ -41,6 +41,8 @@ defmodule HomeBase.MixProject do
       {:membrane_camera_capture_plugin, "~> 0.7"},
       # emerge 0.5.0 plus the scene-forwarding hooks in docs/EMERGE-FORWARDING.md.
       {:emerge, path: System.get_env("EMERGE_PATH", "/root/workspace/emerge-home")},
+      # Only used when building emerge's NIF from source (EMERGE_SKIA_BUILD=true).
+      {:rustler, "~> 0.38.0", runtime: false},
       {:solve, "~> 0.3.1"},
       {:membrane_portaudio_plugin, "~> 0.19"},
       {:membrane_audio_mix_plugin, "~> 0.16"},

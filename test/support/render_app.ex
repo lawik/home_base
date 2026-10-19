@@ -83,6 +83,17 @@ defmodule Home.Test.Render do
     {session, app}
   end
 
+  @doc "Start the counter app rendered to pixels (§6.2) on `target`; return `{video, app}`."
+  def show_pixels(target, opts \\ []) do
+    {:ok, app} = GenServer.start(Home.Test.CounterApp, [])
+    viewport_opts = Keyword.merge([app: app], opts)
+
+    {:ok, video} =
+      Home.Render.show_pixels({Home.Test.CounterViewport, viewport_opts}, on: target)
+
+    {video, app}
+  end
+
   def count(app), do: Solve.subscribe(app, :counter).count
 
   @doc "The element id (as emerge sends it in events) of the element keyed `key` in the session's tree."
