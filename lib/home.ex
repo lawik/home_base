@@ -63,6 +63,8 @@ defmodule Home do
         type: :supervisor,
         start: {Supervisor, :start_link, [capabilities, [strategy: :one_for_one]]}
       },
+      # Capabilities added at runtime (`Home.Capability.add/1`), e.g. ONVIF cameras.
+      {DynamicSupervisor, name: Home.Capability.Runtime, strategy: :one_for_one},
       {Home.Lease.Watchdog, interval: Keyword.get(opts, :watchdog_interval, 1_000)},
       {DynamicSupervisor, name: Home.Media.Supervisor, strategy: :one_for_one},
       {DynamicSupervisor, name: Home.Render.Supervisor, strategy: :one_for_one},
