@@ -6,8 +6,11 @@ defmodule Home.Activity do
   the latest event per `{cap, kind}` and a bounded ring of recent ones, last writer (by
   `ts`) wins. A node asks peers for a snapshot when they come up.
 
-  Rate limits are per `{cap, kind, event}`: `:input` events at most one per 250 ms,
-  `:display` `:frame` and `:level` one per second; everything else is never dropped.
+  Rate limits are per `{cap, kind, event}`: by default `:input` events at most one per
+  250 ms, `:display` `:frame` and `:level` one per second; everything else (start/stop,
+  lease events) is never throttled. An adapter can set its own with `throttle: ms`.
+  Throttling coalesces rather than drops: the first event of a burst goes out at once,
+  the last one goes out when the interval is up, so the final state is never lost.
   """
 
   use GenServer
@@ -35,24 +38,57 @@ defmodule Home.Activity do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "Emit an event for a capability on this node. Returns `:ok` or `:throttled`."
-  def emit(cap, kind, event, data \\ %{}) do
-    mono = System.monotonic_time(:millisecond)
+  @doc """
+  Emit an event for a capability on this node. `cap` is a `{node, id}` ref or the
+  `Home.Capability` struct an adapter gets in `init/1`. Options: `throttle: ms` overrides
+  the default rate limit for this `{cap, kind, event}` (0 disables it).
 
-    if throttled?({cap, kind, event}, min_interval(kind, event), mono) do
-      :throttled
-    else
-      ev = %Event{
-        cap: cap,
-        kind: kind,
-        event: event,
-        ts: System.system_time(:millisecond),
-        mono: mono,
-        area: Home.Registry.area(),
-        data: data
-      }
+  Returns `:ok`, or `:throttled` if the event was held back; a held-back event is sent
+  when the interval is up unless a newer one replaces it first.
 
-      Phoenix.PubSub.broadcast(Home.PubSub, @topic, {:activity, ev})
+      Home.Activity.emit(cap, :input, :touch, %{session: nil})
+      Home.Activity.emit(cap, :audio_in, :level, %{session: pid, level_db: -32.0})
+  """
+  def emit(cap, kind, event, data \\ %{}, opts \\ []) do
+    cap = ref(cap)
+
+    ev = %Event{
+      cap: cap,
+      kind: kind,
+      event: event,
+      ts: System.system_time(:millisecond),
+      mono: System.monotonic_time(:millisecond),
+      area: Home.Registry.area(),
+      data: data
+    }
+
+    key = {cap, kind, event}
+
+    case Keyword.get_lazy(opts, :throttle, fn -> min_interval(kind, event) end) do
+      0 -> publish(ev)
+      interval -> throttle(key, ev, interval)
+    end
+  end
+
+  defp ref(%Home.Capability{id: id}), do: {node(), id}
+  defp ref({node, _id} = ref) when is_atom(node), do: ref
+
+  defp publish(ev), do: Phoenix.PubSub.broadcast(Home.PubSub, @topic, {:activity, ev})
+
+  # @throttle rows: {key, mono of the last publish, held-back event or nil}.
+  defp throttle(key, ev, interval) do
+    case :ets.lookup(@throttle, key) do
+      [{_, at, pending}] when ev.mono - at < interval ->
+        :ets.insert(@throttle, {key, at, ev})
+
+        if is_nil(pending),
+          do: Process.send_after(__MODULE__, {:flush, key}, at + interval - ev.mono)
+
+        :throttled
+
+      _ ->
+        :ets.insert(@throttle, {key, ev.mono, nil})
+        publish(ev)
     end
   end
 
@@ -64,12 +100,16 @@ defmodule Home.Activity do
     end
   end
 
-  @doc "Latest event per cap for `kind:`, optionally scoped by `area:` (the event's area)."
+  @doc """
+  Latest event per cap for `kind:`, optionally scoped by `area:` (the event's area).
+  Most recent first.
+  """
   def last(filters) when is_list(filters) do
     kind = Keyword.fetch!(filters, :kind)
     area = Keyword.get(filters, :area)
 
-    for {{_cap, ^kind}, ev, _} <- :ets.tab2list(@last), is_nil(area) or ev.area == area, do: ev
+    for({{_cap, ^kind}, ev, _} <- :ets.tab2list(@last), is_nil(area) or ev.area == area, do: ev)
+    |> Enum.sort_by(&{&1.ts, &1.mono}, :desc)
   end
 
   @doc "Events for `{cap, kind}` in the last `ms` milliseconds (wall clock), oldest first."
@@ -77,7 +117,7 @@ defmodule Home.Activity do
     cutoff = System.system_time(:millisecond) - ms
 
     case :ets.lookup(@last, {cap, kind}) do
-      [{_, _ev, ring}] -> ring |> :queue.to_list() |> Enum.filter(&(&1.ts >= cutoff))
+      [{_, _ev, ring}] -> ring |> :queue.to_list() |> Enum.filter(&(&1.ts >= cutoff)) |> sort()
       [] -> []
     end
   end
@@ -89,7 +129,10 @@ defmodule Home.Activity do
   def subscribe({node, id}),
     do: Phoenix.PubSub.subscribe(Home.PubSub, "activity:cap:#{node}/#{id}")
 
-  def snapshot, do: :ets.tab2list(@last)
+  @doc "Everything this node holds: `[{{cap, kind}, latest_event, recent_events}]`, oldest first."
+  def snapshot do
+    for {key, ev, ring} <- :ets.tab2list(@last), do: {key, ev, sort(:queue.to_list(ring))}
+  end
 
   ## Server
 
@@ -116,11 +159,29 @@ defmodule Home.Activity do
   end
 
   def handle_info({:snapshot, rows}, state) do
-    for {key, ev, ring} <- rows do
+    for {key, ev, events} <- rows do
       case :ets.lookup(@last, key) do
-        [{_, mine, _}] when mine.ts >= ev.ts -> :ok
-        _ -> :ets.insert(@last, {key, ev, ring})
+        [{_, mine, my_ring}] ->
+          last = if mine.ts >= ev.ts, do: mine, else: ev
+          events = Enum.uniq(:queue.to_list(my_ring) ++ events)
+          :ets.insert(@last, {key, last, trim(events, state)})
+
+        [] ->
+          :ets.insert(@last, {key, ev, trim(events, state)})
       end
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:flush, key}, state) do
+    case :ets.lookup(@throttle, key) do
+      [{_, _at, %Event{} = ev}] ->
+        :ets.insert(@throttle, {key, System.monotonic_time(:millisecond), nil})
+        publish(ev)
+
+      _ ->
+        :ok
     end
 
     {:noreply, state}
@@ -131,7 +192,7 @@ defmodule Home.Activity do
     {:noreply, state}
   end
 
-  def handle_info({:nodedown, _}, state), do: {:noreply, state}
+  def handle_info(_msg, state), do: {:noreply, state}
 
   defp ask(peer) do
     me = self()
@@ -160,21 +221,11 @@ defmodule Home.Activity do
     :ets.insert(@last, {key, last, ring})
   end
 
+  defp trim(events, state), do: events |> sort() |> Enum.take(-state.ring) |> :queue.from_list()
+  defp sort(events), do: Enum.sort_by(events, &{&1.ts, &1.mono})
+
   defp min_interval(:input, _), do: 250
   defp min_interval(:display, :frame), do: 1_000
   defp min_interval(_, :level), do: 1_000
   defp min_interval(_, _), do: 0
-
-  defp throttled?(_key, 0, _now), do: false
-
-  defp throttled?(key, interval, now) do
-    case :ets.lookup(@throttle, key) do
-      [{_, at}] when now - at < interval ->
-        true
-
-      _ ->
-        :ets.insert(@throttle, {key, now})
-        false
-    end
-  end
 end
