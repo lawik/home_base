@@ -17,7 +17,7 @@ defmodule Home.Render.Session do
   require Logger
 
   alias Home.Lease
-  alias Home.Render.{Assets, AssetTransfer, Compositor}
+  alias Home.Render.{Assets, AssetTransfer, Compositor, Retained}
 
   defstruct [
     :app,
@@ -31,6 +31,7 @@ defmodule Home.Render.Session do
     view: %{},
     hashes: %{},
     files: %{},
+    retained: %Home.Render.Retained{},
     sent: MapSet.new()
   ]
 
@@ -161,7 +162,7 @@ defmodule Home.Render.Session do
   @impl true
   def handle_info({:home_render_input, comp, event}, %{compositor: comp} = state) do
     if state.input_target, do: send(state.input_target, {:emerge_skia_event, event})
-    {:noreply, state}
+    {:noreply, %{state | retained: Retained.record(state.retained, event)}}
   end
 
   def handle_info({:home_render_close, comp, reason}, %{compositor: comp} = state) do
@@ -237,8 +238,9 @@ defmodule Home.Render.Session do
 
   defp resync(%{tree: nil}), do: :ok
 
+  # A new renderer: the full tree, with the scroll positions and focus the last one had.
   defp resync(state) do
-    bin = Emerge.Engine.Serialization.encode_tree(state.tree)
+    bin = Emerge.Engine.Serialization.encode_tree(Retained.restore(state.tree, state.retained))
     Compositor.upload(state.compositor, self(), bin)
   end
 

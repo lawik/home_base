@@ -160,7 +160,13 @@ separate id spaces in one renderer: a third, larger upstream change, not done.
   input either as already-hit-tested events (`Compositor.input/2`) or, with a
   source-built NIF, as raw pointer input into B's renderer (`Compositor.inject/2`),
   which hit-tests it against A's tree (`test/render_input_test.exs`).
-* Native retained UI state (scroll offsets, text-input caret, focus) is not carried
-  across `move/2` or a re-shown session; the tree is.
+* Native retained UI state: scroll positions and focus are carried across `move/2`
+  and a re-shown session (`Home.Render.Retained`): `Home.Render.Remote` adds
+  `on_scroll`/`on_focus`/`on_blur` handlers where the app has none, the session
+  records the events as they pass, and the full tree for a new renderer carries them
+  as emerge's one-shot `scroll_x/y` fractions and `focus_on_mount`. No emerge change.
+  The caret/selection in a text input is not kept (emerge does not report it; a
+  restored focus puts the caret at the start): that would need a native
+  "export/import runtime state" call.
 * No separate `:input` capability lease; the display's renderer is the input source.
 * §6.2 pixel forwarding and §6.3 video surfaces: see `VIDEO.md` (M5).

@@ -147,3 +147,39 @@ defmodule Home.Test.Render do
     :error, _ -> true
   end
 end
+
+defmodule Home.Test.FormViewport do
+  @moduledoc false
+  # A text input on top (y 0..30) and a scroll list below it (y 30..90) of 30 px stripes,
+  # red, blue, red, ... Text changes go to `test` as {:changed, text}.
+  use Emerge
+
+  @impl Viewport
+  def mount(opts) do
+    config = %Emerge.Config{runtime: Keyword.get(opts, :runtime, []), assets: [otp_app: :emerge]}
+    {:ok, %{test: opts[:test], text: ""}, config}
+  end
+
+  @impl Viewport
+  def render(%{text: text}) do
+    column([width(fill()), height(fill()), Background.color(color_rgb(0, 0, 0))], [
+      Input.text(
+        [key(:field), width(px(100)), height(px(30)), Event.on_change(:changed)],
+        text
+      ),
+      column(
+        [key(:list), width(fill()), height(px(60)), scrollbar_y()],
+        for i <- 0..9 do
+          color = if rem(i, 2) == 0, do: color_rgb(255, 0, 0), else: color_rgb(0, 0, 255)
+          el([key(i), width(fill()), height(px(30)), Background.color(color)], none())
+        end
+      )
+    ])
+  end
+
+  @impl Viewport
+  def handle_info({:changed, text}, state) do
+    if state.test, do: send(state.test, {:changed, text})
+    {:noreply, Viewport.rerender(%{state | text: text})}
+  end
+end
