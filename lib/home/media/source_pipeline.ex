@@ -43,7 +43,7 @@ defmodule Home.Media.SourcePipeline do
     state =
       opts
       |> Map.put(:local_ip, local_ip)
-      |> Map.merge(%{receivers: %{}, sent: %{}, keyframes: 0})
+      |> Map.merge(%{receivers: %{}, sent: %{}, keyframes: 0, added: MapSet.new()})
 
     {[spec: spec], state}
   end
@@ -101,8 +101,11 @@ defmodule Home.Media.SourcePipeline do
   end
 
   @impl true
-  def handle_child_notification({:receiver_report, dest, report}, :rtcp, _ctx, state),
-    do: {[], put_in(state.receivers[dest], report)}
+  # A report without a round trip (no SR had reached the sink yet) keeps the last one.
+  def handle_child_notification({:receiver_report, dest, report}, :rtcp, _ctx, state) do
+    report = Map.update!(report, :rtt_ms, &(&1 || get_in(state.receivers, [dest, :rtt_ms])))
+    {[], put_in(state.receivers[dest], report)}
+  end
 
   def handle_child_notification({:sender_stats, stats}, :rtcp, _ctx, state),
     do: {[], %{state | sent: stats}}
@@ -127,8 +130,8 @@ defmodule Home.Media.SourcePipeline do
     if Map.has_key?(ctx.children, {:udp, dest}) do
       {[reply: :ok], state}
     else
-      # A new receiver can't start decoding video before a keyframe.
-      {[spec: destination(dest, state.local_ip), reply: :ok] ++ keyframe(state), state}
+      spec = destination(dest, state.local_ip)
+      {[spec: spec, reply: :ok], %{state | added: MapSet.put(state.added, dest)}}
     end
   end
 
@@ -139,6 +142,17 @@ defmodule Home.Media.SourcePipeline do
       do: {[remove_children: {:udp, dest}, reply: :ok], state},
       else: {[reply: :ok], state}
   end
+
+  @impl true
+  # A receiver added to a running stream can't start decoding video before a keyframe:
+  # force one as soon as its endpoint is linked.
+  def handle_child_playing({:udp, dest}, _ctx, state) do
+    if MapSet.member?(state.added, dest),
+      do: {keyframe(state), %{state | added: MapSet.delete(state.added, dest)}},
+      else: {[], state}
+  end
+
+  def handle_child_playing(_child, _ctx, state), do: {[], state}
 
   defp keyframe(%{codec: :h264}), do: [notify_child: {:keyframes, :keyframe_request}]
   defp keyframe(_state), do: []

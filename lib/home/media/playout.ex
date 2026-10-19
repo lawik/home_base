@@ -10,7 +10,7 @@ defmodule Home.Media.Playout do
   of each buffer is known on arrival. Anything that delivers a burst (the jitter
   buffer's start-up hold, a network stall that releases a backlog, a sender whose clock
   runs fast) shows up as a queue that stays long. When the shortest queue seen over the
-  last `window` ms is still more than one buffer above `target`, buffers are dropped
+  last `window` ms is still more than half a buffer above `target`, buffers are dropped
   until it isn't: quiet ones (peak below `quiet`) first, any one once `patience` ms have
   passed without a quiet one. A momentary peak (jitter) is left alone; the window
   minimum only stays high when the excess is permanent.
@@ -65,15 +65,17 @@ defmodule Home.Media.Playout do
     now = System.monotonic_time(:microsecond)
     duration = duration(payload, state.format)
 
-    {cursor, state} =
+    {cursor, started?, state} =
       cond do
-        state.cursor == nil -> {now, state}
-        state.cursor >= now -> {state.cursor, state}
-        true -> {now, %{state | underruns: state.underruns + 1, excess_min: nil}}
+        state.cursor == nil -> {now, true, state}
+        state.cursor >= now -> {state.cursor, false, state}
+        true -> {now, true, %{state | underruns: state.underruns + 1, excess_min: nil}}
       end
 
     queue = cursor - now
-    {notify, state} = window(state, queue, now)
+
+    # The empty queue a (re)start begins with says nothing about the queue that builds up.
+    {notify, state} = if started?, do: {[], state}, else: window(state, queue, now)
 
     if drop?(state, duration, payload, now) do
       state = %{
@@ -121,7 +123,8 @@ defmodule Home.Media.Playout do
   defp drop?(%{excess_min: nil}, _duration, _payload, _now), do: false
 
   defp drop?(state, duration, payload, now) do
-    if state.excess_min - duration >= state.opts.target * 1_000 do
+    # Drop while that brings the queue closer to the target.
+    if state.excess_min - state.opts.target * 1_000 > div(duration, 2) do
       quiet?(payload, state.opts.quiet) or
         (state.excess_since != nil and now - state.excess_since >= state.opts.patience * 1_000)
     else

@@ -63,9 +63,28 @@ defmodule Home.Render.Video do
   def handle_call(:target, _from, state), do: {:reply, state.display.cap, state}
   def handle_call(:media, _from, state), do: {:reply, state.media, state}
 
-  # `Home.Render.move/2`: the receiving pipeline lives on the display node, so moving
-  # would mean a new media session. Stop and show again instead.
-  def handle_call({:move, _target}, _from, state), do: {:reply, {:error, :not_supported}, state}
+  def handle_call({:move, target}, _from, %{display: %{cap: target}} = state),
+    do: {:reply, :ok, state}
+
+  # `Home.Render.move/2`: the new display joins the media session as a second sink (the
+  # source sends it a keyframe), then the old one leaves it. The source keeps running.
+  def handle_call({:move, target}, from, state) do
+    purpose = state.display.purpose || "video"
+
+    with {:ok, display} <- acquire_display(target, purpose),
+         new = %{state | display: display, compositor: display.endpoint},
+         :ok <- attach_or_release(new),
+         :ok <- add_sink(new) do
+      _ = Home.Media.Session.remove_sink(state.media, state.display.cap)
+      # The move is done once the new display has the video; the old compositor can
+      # take its time to let go.
+      GenServer.reply(from, :ok)
+      safe(fn -> Compositor.detach(state.compositor, self()) end)
+      {:noreply, new}
+    else
+      error -> {:reply, error, state}
+    end
+  end
 
   @impl true
   def handle_info({:home_render_input, comp, event}, %{compositor: comp} = state) do
@@ -159,6 +178,31 @@ defmodule Home.Render.Video do
     end
   end
 
+  defp attach_or_release(state) do
+    case attach(state) do
+      :ok ->
+        :ok
+
+      {:error, reason, _state} ->
+        Lease.release(state.display)
+        {:error, reason}
+    end
+  end
+
+  defp add_sink(state) do
+    case Home.Media.Session.add_sink(state.media, state.display) do
+      :ok ->
+        :ok
+
+      error ->
+        safe(fn -> Compositor.detach(state.compositor, self()) end)
+        Lease.release(state.display)
+        error
+    end
+  catch
+    :exit, reason -> {:error, {:media_down, reason}}
+  end
+
   # A camera lease (or its capability, leased here), or an app to render here.
   defp media_source(%Lease{} = lease, _purpose, _opts), do: {:ok, lease}
 
@@ -172,7 +216,7 @@ defmodule Home.Render.Video do
   defp start_media(state, source, display, opts) do
     media_opts =
       opts
-      |> Keyword.take([:bitrate, :gop_size, :jitter, :renew_every])
+      |> Keyword.take([:bitrate, :gop_size, :jitter, :renew_every, :feedback, :route])
       |> Keyword.merge(
         source: source,
         sink: display,

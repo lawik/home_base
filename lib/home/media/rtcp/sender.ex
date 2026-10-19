@@ -76,6 +76,8 @@ defmodule Home.Media.RTCP.Sender do
   def handle_buffer(:input, %Buffer{payload: payload} = buffer, _ctx, state) do
     case payload do
       <<2::2, _p::1, _x::1, cc::4, _m::1, _pt::7, seq::16, ts::32, ssrc::32, _::binary>> ->
+        first? = state.ssrc == nil
+
         state = %{
           state
           | ssrc: ssrc,
@@ -85,7 +87,9 @@ defmodule Home.Media.RTCP.Sender do
             last_wall: System.monotonic_time(:microsecond)
         }
 
-        {[buffer: {:output, buffer}], remember(state, seq, payload)}
+        # The first SR right away, so receivers can report a round trip early.
+        sr = if first?, do: sender_report(state), else: []
+        {[buffer: {:output, buffer}] ++ sr, remember(state, seq, payload)}
 
       _ ->
         {[buffer: {:output, buffer}], state}
@@ -107,7 +111,10 @@ defmodule Home.Media.RTCP.Sender do
   @impl true
   def handle_tick(:report, _ctx, %{ssrc: nil} = state), do: {[], state}
 
-  def handle_tick(:report, _ctx, state) do
+  def handle_tick(:report, _ctx, state), do: {sender_report(state), state}
+
+  # An SR now, and the stats so far.
+  defp sender_report(state) do
     elapsed = System.monotonic_time(:microsecond) - state.last_wall
     rtp_ts = state.last_ts + div(elapsed * state.opts.clock_rate, 1_000_000)
 
@@ -128,7 +135,7 @@ defmodule Home.Media.RTCP.Sender do
     }
 
     payload = ExRTCP.CompoundPacket.encode([sr])
-    {[buffer: {:output, %Buffer{payload: payload}}, notify_parent: {:sender_stats, stats}], state}
+    [buffer: {:output, %Buffer{payload: payload}}, notify_parent: {:sender_stats, stats}]
   end
 
   defp feedback(%ReceiverReport{reports: reports}, id, state) do
