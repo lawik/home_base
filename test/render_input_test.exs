@@ -4,6 +4,7 @@ defmodule Home.RenderInputTest do
   alias Home.Test.{MediaHelpers, Render, VideoHelpers}
 
   @moduletag timeout: 120_000
+  @moduletag :emerge_inject
 
   # The counter viewport (`Home.Test.CounterViewport`): a 40x40 button at the top left,
   # red background for even counts, blue for odd.
@@ -22,6 +23,23 @@ defmodule Home.RenderInputTest do
 
     for n <- [a, b], do: rpc(n, MediaHelpers, :preload)
     %{a: a, b: b}
+  end
+
+  test "scene forwarding: B's renderer hit-tests a press against A's tree", %{a: a, b: b} do
+    {session, app} = rpc(a, Render, :show, [{b, "disp0"}])
+    assert rpc(b, VideoHelpers, :await_pixel, ["disp0", @bg, &VideoHelpers.red?/1])
+
+    # Raw pointer input into B's renderer, as from a mouse or touchscreen on B: B finds
+    # the button (an element id from A's tree) and A's viewport routes the press.
+    :ok = rpc(b, Render, :tap, ["disp0", @button])
+    assert eventually(fn -> rpc(a, Render, :count, [app]) == 1 end)
+    assert rpc(b, VideoHelpers, :await_pixel, ["disp0", @bg, &VideoHelpers.blue?/1])
+
+    :ok = rpc(b, Render, :tap, ["disp0", @bg])
+    Process.sleep(300)
+    assert rpc(a, Render, :count, [app]) == 1
+
+    :ok = rpc(a, Home.Render, :stop, [session])
   end
 
   test "pixel forwarding: a click on B is hit-tested on A and fires the element's on_press", %{
@@ -44,6 +62,10 @@ defmodule Home.RenderInputTest do
     rpc(b, VideoHelpers, :click, ["disp0", @button])
     assert eventually(fn -> rpc(a, Render, :count, [app]) == 2 end)
     assert rpc(b, VideoHelpers, :await_pixel, ["disp0", @bg, &VideoHelpers.red?/1])
+
+    # The same through B's own renderer: it reports the raw press, which goes to A.
+    :ok = rpc(b, Render, :tap, ["disp0", @button])
+    assert eventually(fn -> rpc(a, Render, :count, [app]) == 3 end)
 
     :ok = rpc(a, Home.Render, :stop, [pixels])
   end

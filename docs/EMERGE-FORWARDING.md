@@ -111,6 +111,23 @@ and upstream-able:
    resolve logical paths inside an OTP app's priv, so B could not draw A's assets
    without rewriting A's tree per display.
 
+3. **`EmergeSkia.inject_input/2`** (branch `home-m8-forwarding`, commit `ada4c6d`;
+   **needs a native rebuild**): feed raw input (the shapes the renderer reports:
+   `{:cursor_button, {button, action, mods, {x, y}}}`, `{:key, ...}`, ...) into a
+   running renderer's event actor, as if its backend had produced it. Hit-testing,
+   element events, focus, text editing and scrolling then run as for native input,
+   with any backend including headless. Used for pixel forwarding (the display's input
+   goes into the app's headless renderer on A, so `on_press` etc. work) and for input
+   drivers that are not the renderer's own backend (`Home.Render.Compositor.inject/2`).
+   About 30 lines of Rust plus the transport plumbing; the macOS host returns
+   `{:error, :unsupported}`.
+
+Building the NIF from source: put cargo on `PATH` (rustup) and compile with
+`EMERGE_SKIA_BUILD=true` (rustler is a build-only dep of home_base for that). The
+first build takes a while (skia-bindings); the result is copied to emerge's
+`priv/native/emerge_skia.so`. Tests that need injection are tagged `:emerge_inject` and
+are excluded automatically when the loaded NIF lacks it (precompiled 0.5.0).
+
 The fork is a copy of the hex 0.5.0 package source plus the patch, used as a path dep
 (`EMERGE_PATH`, default `/root/workspace/emerge-home`). Once upstream has these,
 switch back to `{:emerge, "~> 0.x"}`.
@@ -126,10 +143,10 @@ separate id spaces in one renderer: a third, larger upstream change, not done.
 
 ## Not done / limits
 
-* Window/DRM outputs are configured but only headless is exercised (VM). Input in the
-  tests is injected into the compositor as native-shaped events (`Compositor.input/2`):
-  headless has no pointer, so hit-testing on B is not exercised; the event's element
-  id comes from A's tree.
+* Window/DRM outputs are configured but only headless is exercised (VM). Tests drive
+  input either as already-hit-tested events (`Compositor.input/2`) or, with a
+  source-built NIF, as raw pointer input into B's renderer (`Compositor.inject/2`),
+  which hit-tests it against A's tree (`test/render_input_test.exs`).
 * Native retained UI state (scroll offsets, text-input caret, focus) is not carried
   across `move/2` or a re-shown session; the tree is.
 * No separate `:input` capability lease; the display's renderer is the input source.

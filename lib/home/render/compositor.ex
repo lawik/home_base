@@ -62,11 +62,23 @@ defmodule Home.Render.Compositor do
 
   ## Display side
 
-  @doc "Feed a native-shaped input event, as if it came from the renderer."
+  @doc """
+  Feed an event as if the renderer had reported it (an element event such as
+  `{element_id, :press}`, or raw input it is subscribed to). Skips hit-testing.
+  """
   def input(comp, event) do
     send(comp, {:emerge_skia_event, event})
     :ok
   end
+
+  @doc """
+  Feed raw input into the display's renderer, as if its own input device had produced
+  it (`EmergeSkia.inject_input/2` shapes: `{:cursor_button, {button, action, mods,
+  {x, y}}}`, `{:key, ...}`, ...). The renderer hit-tests it against the shown tree,
+  so element events come out as from a real pointer or keyboard. For an input driver
+  that is not the renderer's own backend, and for tests.
+  """
+  def inject(comp, event), do: GenServer.call(comp, {:inject, event})
 
   @doc "The session drawn now, or nil."
   def shown(comp), do: GenServer.call(comp, :shown)
@@ -114,6 +126,12 @@ defmodule Home.Render.Compositor do
 
   def handle_call(:shown, _from, state), do: {:reply, top(state), state}
   def handle_call(:frame, _from, state), do: {:reply, state.frame, state}
+
+  def handle_call({:inject, _event}, _from, %{renderer: nil} = state),
+    do: {:reply, {:error, :not_rendering}, state}
+
+  def handle_call({:inject, event}, _from, state),
+    do: {:reply, EmergeSkia.inject_input(state.renderer, event), state}
 
   def handle_call({:capture, _opts}, _from, %{renderer: nil} = state),
     do: {:reply, {:error, :not_rendering}, state}

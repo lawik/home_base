@@ -130,4 +130,20 @@ defmodule Home.Test.Render do
   end
 
   def shown(cap_id), do: Home.Render.Compositor.shown(compositor(cap_id))
+
+  @doc "Press and release the left button at `{x, y}` on the display's renderer (hit-tested there)."
+  def tap(cap_id, {x, y}) do
+    comp = compositor(cap_id)
+    :ok = Home.Render.Compositor.inject(comp, {:cursor_button, {:left, :press, [], {x, y}}})
+    :ok = Home.Render.Compositor.inject(comp, {:cursor_button, {:left, :release, [], {x, y}}})
+  end
+
+  @doc "Whether the loaded emerge NIF has `EmergeSkia.inject_input/2` (a source build)."
+  def inject_supported? do
+    EmergeSkia.Native.renderer_inject_input(make_ref(), {:focused, true})
+    true
+  catch
+    :error, :nif_not_loaded -> false
+    :error, _ -> true
+  end
 end
