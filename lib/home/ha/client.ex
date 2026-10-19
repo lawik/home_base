@@ -4,7 +4,7 @@ defmodule Home.HA.Client do
   Each call opens a connection, runs its commands and closes; placement changes rarely.
 
   The socket is used in passive mode, so the client never touches the calling process's
-  mailbox (it runs inside `Home.Registry`).
+  mailbox. `Home.Registry` runs its lookups in a task.
   """
 
   @timeout 10_000

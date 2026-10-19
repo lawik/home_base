@@ -7,8 +7,10 @@ defmodule Home.Registry do
   Area comes from Home Assistant (`refresh_area/0`) and is persisted, so it survives HA
   being down. Until the first lookup it is `nil`, and area-scoped queries skip this node.
   The lookup runs at boot, every `ha: [area_refresh: ms]` (default 3 h), and whenever
-  `:ha_url` or `:ha_token` change in `Home.Secrets`. Area changes are broadcast on
-  `"registry"` (cluster-wide) as `{:area_changed, node, area}`.
+  `:ha_url` or `:ha_token` change in `Home.Secrets`. It runs in a task under
+  `Home.TaskSupervisor`, so a slow or hung HA never blocks the registry; the registry
+  only applies the result. Area changes are broadcast on `"registry"` (cluster-wide) as
+  `{:area_changed, node, area}`.
   """
 
   use GenServer
@@ -17,6 +19,7 @@ defmodule Home.Registry do
   @scope :home
   @table __MODULE__
   @cache_ttl 1_000
+  @ha_timeout 10_000
 
   def start_link(manifest), do: GenServer.start_link(__MODULE__, manifest, name: __MODULE__)
 
@@ -53,8 +56,23 @@ defmodule Home.Registry do
   @doc "Set this node's area (persisted). Normally called by `refresh_area/0`."
   def put_area(area), do: GenServer.call(__MODULE__, {:put_area, area})
 
-  @doc "Ask Home Assistant for this node's area now."
-  def refresh_area(timeout \\ 15_000), do: GenServer.call(__MODULE__, :refresh_area, timeout)
+  @doc """
+  Ask Home Assistant for this node's area now. Returns `{:ok, area}` (`nil` if the device
+  has no area in HA) or `{:error, reason}`; on error the last known area is kept.
+
+  Callers that ask while a lookup is running share its result. A lookup that takes
+  longer than `ha: [lookup_timeout: ms]` (default three times `ha: [timeout: ms]`) is
+  killed and answers `{:error, :timeout}`. The default call `timeout` is the lookup
+  timeout plus 5 s.
+  """
+  def refresh_area(timeout \\ nil) do
+    GenServer.call(__MODULE__, :refresh_area, timeout || lookup_timeout() + 5_000)
+  end
+
+  defp lookup_timeout do
+    ha = Home.config(:ha, [])
+    Keyword.get(ha, :lookup_timeout, 3 * Keyword.get(ha, :timeout, @ha_timeout))
+  end
 
   defp lookup(key) do
     case :ets.lookup(@table, key) do
@@ -98,7 +116,10 @@ defmodule Home.Registry do
     {:ok,
      %{
        area_refresh: Keyword.get(ha, :area_refresh, :timer.hours(3)),
-       ha_timeout: Keyword.get(ha, :timeout, 10_000)
+       ha_timeout: Keyword.get(ha, :timeout, @ha_timeout),
+       lookup_timeout: lookup_timeout(),
+       # The running HA lookup: %{task: Task.t(), timer: reference(), waiters: [from]}.
+       lookup: nil
      }}
   end
 
@@ -108,15 +129,28 @@ defmodule Home.Registry do
     {:reply, :ok, state}
   end
 
-  def handle_call(:refresh_area, _from, state) do
-    {:reply, do_refresh(state), state}
+  def handle_call(:refresh_area, from, state) do
+    {:noreply, start_lookup(state, [from])}
   end
 
   @impl true
   def handle_info(:refresh_area, state) do
-    _ = do_refresh(state)
     Process.send_after(self(), :refresh_area, state.area_refresh)
-    {:noreply, state}
+    {:noreply, start_lookup(state, [])}
+  end
+
+  def handle_info({ref, result}, %{lookup: %{task: %{ref: ref}}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, lookup_done(state, apply_area(result))}
+  end
+
+  def handle_info({:DOWN, ref, :process, _, reason}, %{lookup: %{task: %{ref: ref}}} = state) do
+    {:noreply, lookup_done(state, log_failure({:error, {:lookup_failed, reason}}))}
+  end
+
+  def handle_info({:lookup_timeout, ref}, %{lookup: %{task: %{ref: ref} = task}} = state) do
+    Task.shutdown(task, :brutal_kill)
+    {:noreply, lookup_done(state, log_failure({:error, :timeout}))}
   end
 
   def handle_info({_ref, :join, {:capability, _kind}, pids}, state) do
@@ -150,9 +184,15 @@ defmodule Home.Registry do
     {:noreply, state}
   end
 
+  # New credentials: a lookup still running with the old ones starts over with the new
+  # ones, and its callers get the new result.
   def handle_info({:secrets_changed, keys}, state) do
-    if :ha_url in keys or :ha_token in keys, do: _ = do_refresh(state)
-    {:noreply, state}
+    if :ha_url in keys or :ha_token in keys do
+      waiters = if state.lookup, do: cancel_lookup(state.lookup), else: []
+      {:noreply, start_lookup(%{state | lookup: nil}, waiters)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -162,21 +202,51 @@ defmodule Home.Registry do
     {:noreply, state}
   end
 
-  defp do_refresh(state) do
-    with {:ok, url} <- Home.Secrets.fetch(:ha_url),
-         {:ok, token} <- Home.Secrets.fetch(:ha_token),
-         {:ok, area} <-
-           Home.HA.Client.area_for_device(url, token, device_id(), timeout: state.ha_timeout) do
-      if area != area(), do: store_area(area)
-      {:ok, area}
-    else
-      :error ->
-        {:error, :no_ha_credentials}
+  # Start an HA lookup in a task, or join the one that is running.
+  defp start_lookup(%{lookup: %{} = running} = state, waiters),
+    do: %{state | lookup: %{running | waiters: waiters ++ running.waiters}}
 
-      {:error, reason} = error ->
-        Logger.warning("HA area lookup failed: #{inspect(reason)}")
-        error
-    end
+  defp start_lookup(state, waiters) do
+    device_id = device_id()
+    timeout = state.ha_timeout
+
+    task =
+      Task.Supervisor.async_nolink(Home.TaskSupervisor, fn ->
+        with {:ok, url} <- Home.Secrets.fetch(:ha_url),
+             {:ok, token} <- Home.Secrets.fetch(:ha_token) do
+          Home.HA.Client.area_for_device(url, token, device_id, timeout: timeout)
+        else
+          :error -> {:error, :no_ha_credentials}
+        end
+      end)
+
+    timer = Process.send_after(self(), {:lookup_timeout, task.ref}, state.lookup_timeout)
+    %{state | lookup: %{task: task, timer: timer, waiters: waiters}}
+  end
+
+  defp cancel_lookup(%{task: task, timer: timer, waiters: waiters}) do
+    Process.cancel_timer(timer)
+    Task.shutdown(task, :brutal_kill)
+    waiters
+  end
+
+  defp lookup_done(%{lookup: %{timer: timer, waiters: waiters}} = state, result) do
+    Process.cancel_timer(timer)
+    for from <- waiters, do: GenServer.reply(from, result)
+    %{state | lookup: nil}
+  end
+
+  defp apply_area({:ok, area} = result) do
+    if area != area(), do: store_area(area)
+    result
+  end
+
+  defp apply_area({:error, :no_ha_credentials} = error), do: error
+  defp apply_area(error), do: log_failure(error)
+
+  defp log_failure({:error, reason} = error) do
+    Logger.warning("HA area lookup failed: #{inspect(reason)}")
+    error
   end
 
   defp store_area(area) do

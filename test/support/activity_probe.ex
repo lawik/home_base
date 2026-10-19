@@ -50,6 +50,26 @@ defmodule Home.Test.ActivityProbe do
     end
   end
 
+  @doc """
+  `procs` processes each emit `n` events `%{p: p, i: i}` about 1 ms apart, all for
+  the same key. When they are done, one more event `%{final: true}` is emitted. Returns
+  the emit results of the final event.
+  """
+  def race(cap, kind, event, procs, n, opts) do
+    1..procs
+    |> Enum.map(fn p ->
+      Task.async(fn ->
+        for i <- 1..n do
+          Activity.emit(cap, kind, event, %{p: p, i: i}, opts)
+          Process.sleep(1)
+        end
+      end)
+    end)
+    |> Task.await_many(30_000)
+
+    Activity.emit(cap, kind, event, %{final: true}, opts)
+  end
+
   @doc "Emit `n` events `%{i: 1..n}`, `every` ms apart. Returns the emit results."
   def burst(cap, kind, event, n, every, opts \\ []) do
     for i <- 1..n do

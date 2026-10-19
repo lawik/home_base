@@ -10,7 +10,9 @@ defmodule Home.Activity do
   250 ms, `:display` `:frame` and `:level` one per second; everything else (start/stop,
   lease events) is never throttled. An adapter can set its own with `throttle: ms`.
   Throttling coalesces rather than drops: the first event of a burst goes out at once,
-  the last one goes out when the interval is up, so the final state is never lost.
+  the last one goes out when the interval is up, so the final state is never lost. Any
+  number of processes may emit for the same key. If this server goes down (a crash or a
+  shutdown, not a `:kill`), whatever it holds back is sent on the way out.
   """
 
   use GenServer
@@ -75,20 +77,53 @@ defmodule Home.Activity do
 
   defp publish(ev), do: Phoenix.PubSub.broadcast(Home.PubSub, @topic, {:activity, ev})
 
-  # @throttle rows: {key, mono of the last publish, held-back event or nil}.
+  # @throttle rows: {key, mono of the last publish, held-back event or nil, version}.
+  # Emitters of the same key race each other and the flush, so every change is a
+  # compare-and-swap on the version: whoever loses looks again. Exactly one emitter
+  # turns "nothing held back" into "held back" per interval, and that one schedules the
+  # flush; at most one event goes out per interval.
   defp throttle(key, ev, interval) do
     case :ets.lookup(@throttle, key) do
-      [{_, at, pending}] when ev.mono - at < interval ->
-        :ets.insert(@throttle, {key, at, ev})
+      [] ->
+        if :ets.insert_new(@throttle, {key, ev.mono, nil, 0}),
+          do: publish(ev),
+          else: throttle(key, ev, interval)
 
-        if is_nil(pending),
-          do: Process.send_after(__MODULE__, {:flush, key}, at + interval - ev.mono)
+      [{_, at, pending, v}] when ev.mono - at < interval ->
+        if swap(key, v, {key, at, ev, v + 1}) do
+          if is_nil(pending),
+            do: Process.send_after(__MODULE__, {:flush, key, at}, at + interval - ev.mono)
 
-        :throttled
+          :throttled
+        else
+          throttle(key, ev, interval)
+        end
+
+      # The interval is up: this event goes out now (and replaces any held-back one,
+      # whose flush then finds nothing to do).
+      [{_, _at, _pending, v}] ->
+        if swap(key, v, {key, ev.mono, nil, v + 1}),
+          do: publish(ev),
+          else: throttle(key, ev, interval)
+    end
+  rescue
+    # Activity is restarting and its table is gone: don't hold anything back.
+    ArgumentError -> publish(ev)
+  end
+
+  defp swap(key, version, row),
+    do: :ets.select_replace(@throttle, [{{key, :_, :_, version}, [], [{:const, row}]}]) == 1
+
+  # Send the held-back event for `key` if it is still held back since the publish at `at`.
+  defp flush(key, at) do
+    case :ets.lookup(@throttle, key) do
+      [{_, ^at, %Event{} = ev, v}] ->
+        if swap(key, v, {key, System.monotonic_time(:millisecond), nil, v + 1}),
+          do: publish(ev),
+          else: flush(key, at)
 
       _ ->
-        :ets.insert(@throttle, {key, ev.mono, nil})
-        publish(ev)
+        :ok
     end
   end
 
@@ -138,6 +173,8 @@ defmodule Home.Activity do
 
   @impl true
   def init(opts) do
+    # So terminate/2 also runs on shutdown, and held-back events still go out.
+    Process.flag(:trap_exit, true)
     :ets.new(@last, [:named_table, :public, read_concurrency: true])
     :ets.new(@throttle, [:named_table, :public, write_concurrency: true])
     Phoenix.PubSub.subscribe(Home.PubSub, @topic)
@@ -174,16 +211,8 @@ defmodule Home.Activity do
     {:noreply, state}
   end
 
-  def handle_info({:flush, key}, state) do
-    case :ets.lookup(@throttle, key) do
-      [{_, _at, %Event{} = ev}] ->
-        :ets.insert(@throttle, {key, System.monotonic_time(:millisecond), nil})
-        publish(ev)
-
-      _ ->
-        :ok
-    end
-
+  def handle_info({:flush, key, at}, state) do
+    flush(key, at)
     {:noreply, state}
   end
 
@@ -193,6 +222,14 @@ defmodule Home.Activity do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Going down (crash or shutdown): the throttle table goes with us, so send what it
+  # holds back now rather than lose the final value of a burst.
+  @impl true
+  def terminate(_reason, _state) do
+    for {_key, _at, %Event{} = ev, _v} <- :ets.tab2list(@throttle), do: publish(ev)
+    :ok
+  end
 
   defp ask(peer) do
     me = self()

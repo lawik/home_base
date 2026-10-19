@@ -17,7 +17,9 @@ defmodule Home do
     * `:cluster` - `[backend: module | {module, opts}, interval: ms]`. Default `Home.Cluster.Epmd`.
     * `:data_dir` - where secrets, area and other node state persist.
     * `:media` - `[ip: ip_tuple, ports: first..last]`, the address and UDP range media is received on.
-    * `:ha` - `[area_refresh: ms, timeout: ms]`. HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).
+    * `:ha` - `[area_refresh: ms, timeout: ms, lookup_timeout: ms]`: how often the area is
+      looked up (3 h), the timeout per network step (10 s) and for a whole lookup (3 × timeout).
+      HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).
     * `:watchdog_interval` - lease watchdog sweep interval in ms.
     * `:activity` - `[ring: n]`, how many recent events to keep per capability and kind (64).
   """
@@ -56,6 +58,7 @@ defmodule Home do
       {Phoenix.PubSub, name: Home.PubSub},
       # Registry reads the HA credentials from Secrets; Activity stamps events with the area.
       Home.Secrets,
+      {Task.Supervisor, name: Home.TaskSupervisor},
       {Home.Registry, manifest},
       {Home.Activity, Keyword.get(opts, :activity, [])},
       %{
