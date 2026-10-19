@@ -180,16 +180,35 @@ unless "--no-media" in opts do
   DemoMedia.preload(node())
   DemoMedia.preload(guest)
   :ok = :erpc.call(guest, HomeNode.Probe, :subscribe, [self()])
-  clock = DemoMedia.clock_offset(guest)
+  # The guest's wall clock moves during the run (NTP pulls it in after boot), so each timed
+  # step converts guest times with an offset re-measured every 200 ms.
+  offset = fn ->
+    clock = DemoMedia.clock_offset(guest)
 
-  IO.puts(
-    "\n   guest clock - host clock = #{div(clock.offset_us, 1000)} ms " <>
-      "(+- #{div(clock.rtt_us, 2000)} ms, best :erpc round trip #{clock.rtt_us} us)"
-  )
+    IO.puts(
+      "   guest clock - host clock = #{div(clock.offset_us, 1000)} ms " <>
+        "(+- #{div(clock.rtt_us, 2000)} ms, best :erpc round trip #{clock.rtt_us} us)"
+    )
+
+    {clock.offset_us, DemoMedia.track_offset(guest)}
+  end
+
+  drift = fn {before, tracker} ->
+    moved = div(DemoMedia.clock_offset(guest).offset_us - before, 1000)
+    IO.puts("   guest clock moved #{moved} ms relative to the host during this step (tracked)")
+    Agent.stop(tracker)
+  end
+
+  sane = fn lat ->
+    Demo.check!(Enum.min(lat) >= -5, "no negative latencies (clock offset holds)")
+  end
 
   Demo.step("audio: guest mic0 (:on_request, synthetic) -> nv1 capture speaker", fn ->
-    lat = DemoMedia.audio({guest, "mic0"}, {me, "spk-nv1"}, guest, clock.offset_us, 4_000)
+    off = offset.()
+    lat = DemoMedia.audio({guest, "mic0"}, {me, "spk-nv1"}, guest, elem(off, 1), 4_000)
     IO.puts("   click -> played on nv1: #{DemoMedia.stats(lat)}")
+    drift.(off)
+    sane.(lat)
     Demo.check!(length(lat) >= 8, "at least 8 clicks heard in 4 s")
     Demo.check!(DemoMedia.p95(lat) <= 250, "p95 <= 250 ms")
 
@@ -199,16 +218,22 @@ unless "--no-media" in opts do
   end)
 
   Demo.step("audio: nv1 mic (synthetic) -> guest spk0 capture speaker", fn ->
-    lat = DemoMedia.audio({me, "mic-nv1"}, {guest, "spk0"}, guest, clock.offset_us, 4_000)
+    off = offset.()
+    lat = DemoMedia.audio({me, "mic-nv1"}, {guest, "spk0"}, guest, elem(off, 1), 4_000)
     IO.puts("   click -> played on guest: #{DemoMedia.stats(lat)}")
+    drift.(off)
+    sane.(lat)
     Demo.check!(length(lat) >= 8, "at least 8 clicks heard in 4 s")
     Demo.check!(DemoMedia.p95(lat) <= 250, "p95 <= 250 ms")
   end)
 
   Demo.step("video: guest cam0 (synthetic H.264, 320x240@30) -> nv1 headless display", fn ->
-    v = DemoMedia.video({guest, "cam0"}, {me, "disp-nv1"}, guest, clock.offset_us, 4_000)
+    off = offset.()
+    v = DemoMedia.video({guest, "cam0"}, {me, "disp-nv1"}, guest, elem(off, 1), 4_000)
     IO.puts("   frames sent #{v.sent}, shown on nv1 #{v.shown}")
     IO.puts("   capture -> on nv1's screen: #{DemoMedia.stats(v.latencies)}")
+    drift.(off)
+    sane.(v.latencies)
     Demo.check!(length(v.latencies) >= 60, "at least 60 frames shown in 4 s")
     Demo.check!(DemoMedia.p95(v.latencies) <= 250, "p95 <= 250 ms")
 

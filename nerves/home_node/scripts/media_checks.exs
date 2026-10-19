@@ -4,7 +4,7 @@
 # Timestamps: the guest's synthetic adapters report through HomeNode.Probe in the guest's
 # wall clock; nv1's in the host's. `clock_offset/1` estimates guest - host from the
 # fastest of 20 :erpc round trips, and guest times are shifted by it. Its error is at most
-# half that round trip (printed).
+# half that round trip (printed). `track_offset/2` keeps re-measuring it during a step.
 
 defmodule DemoMedia.App do
   @moduledoc false
@@ -64,6 +64,32 @@ defmodule DemoMedia do
 
     {rtt, offset} = Enum.min(samples)
     %{offset_us: offset, rtt_us: rtt}
+  end
+
+  @doc """
+  Re-measure the guest - host offset every `every` ms in a linked process, so guest times
+  are converted with an offset at most `every` ms old. After a fresh boot NTP is still
+  pulling the guest's clock in (tens of ms per second), so a single offset doesn't hold for
+  a whole step. Returns the tracker; pass it where an offset is expected.
+  """
+  def track_offset(guest, every \\ 200) do
+    {:ok, agent} = Agent.start_link(fn -> clock_offset(guest).offset_us end)
+
+    spawn_link(fn -> track_loop(agent, guest, every) end)
+    agent
+  end
+
+  defp track_loop(agent, guest, every) do
+    Process.sleep(every)
+    offset = clock_offset(guest).offset_us
+
+    try do
+      Agent.update(agent, fn _ -> offset end)
+      track_loop(agent, guest, every)
+    catch
+      # The step is over and stopped its tracker.
+      :exit, _ -> :ok
+    end
   end
 
   @doc """
@@ -149,8 +175,9 @@ defmodule DemoMedia do
     {sent, shown} = collect_video(cam, watcher, guest, offset_us, %{}, %{})
     Home.Render.stop(video)
 
+    # A black display decodes as frame 0, so frame 0 can look "shown" before it was sent.
     lat =
-      for {n, t} <- shown, s = sent[n], s != nil, do: (t - s) / 1_000
+      for {n, t} <- shown, n != 0, s = sent[n], s != nil, do: (t - s) / 1_000
 
     %{latencies: lat, sent: map_size(sent), shown: map_size(shown)}
   end
@@ -256,6 +283,9 @@ defmodule DemoMedia do
     %{astate: %{compositor: comp}} = :erpc.call(node, :sys, :get_state, [pid])
     comp
   end
+
+  defp host_time({node, _}, t, guest, tracker) when node == guest and is_pid(tracker),
+    do: t - Agent.get(tracker, & &1)
 
   defp host_time({node, _}, t, guest, offset) when node == guest, do: t - offset
   defp host_time(_cap, t, _guest, _offset), do: t
