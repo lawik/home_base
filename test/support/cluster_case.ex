@@ -14,6 +14,8 @@ defmodule Home.Test.ClusterCase do
   other with a static peer list, and wait until they are meshed. Returns the node names.
   """
   def start_cluster(prefix, specs) do
+    # The OS pid keeps concurrent test runs on this machine from reusing node names.
+    prefix = "#{prefix}#{System.pid()}"
     names = for {suffix, _} <- specs, do: :"#{prefix}#{suffix}@127.0.0.1"
 
     tmp =
