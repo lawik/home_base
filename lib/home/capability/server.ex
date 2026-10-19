@@ -19,6 +19,11 @@ defmodule Home.Capability.Server do
     %{id: {__MODULE__, id}, start: {__MODULE__, :start_link, [cap]}, restart: :transient}
   end
 
+  @doc """
+  The capability as `Home.Registry.list/1` returns it: `%{ref, cap, pid, device_id, area,
+  status (:idle | :leased), hardware (:on | :off), leases (count), held_by: [%{ref,
+  holder, purpose}]}`.
+  """
   def info(pid, timeout \\ 5_000), do: GenServer.call(pid, :info, timeout)
 
   def local_servers do
@@ -228,7 +233,11 @@ defmodule Home.Capability.Server do
       area: Home.Registry.area(),
       status: if(state.leases == %{}, do: :idle, else: :leased),
       hardware: state.hardware,
-      leases: map_size(state.leases)
+      leases: map_size(state.leases),
+      held_by:
+        for {ref, %{lease: lease}} <- state.leases do
+          %{ref: ref, holder: lease.holder, purpose: lease.purpose}
+        end
     }
   end
 
