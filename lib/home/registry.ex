@@ -6,6 +6,9 @@ defmodule Home.Registry do
 
   Area comes from Home Assistant (`refresh_area/0`) and is persisted, so it survives HA
   being down. Until the first lookup it is `nil`, and area-scoped queries skip this node.
+  The lookup runs at boot, every `ha: [area_refresh: ms]` (default 3 h), and whenever
+  `:ha_url` or `:ha_token` change in `Home.Secrets`. Area changes are broadcast on
+  `"registry"` (cluster-wide) as `{:area_changed, node, area}`.
   """
 
   use GenServer
@@ -86,11 +89,17 @@ defmodule Home.Registry do
 
     {_ref, _groups} = :pg.monitor_scope(@scope)
     Phoenix.PubSub.subscribe(Home.PubSub, "leases")
+    Phoenix.PubSub.subscribe(Home.PubSub, "registry")
+    Phoenix.PubSub.subscribe(Home.PubSub, "secrets:changed")
 
-    interval = Keyword.get(Home.config(:ha, []), :area_refresh, :timer.hours(3))
-    if Home.config(:ha), do: send(self(), :refresh_area)
+    ha = Home.config(:ha, [])
+    send(self(), :refresh_area)
 
-    {:ok, %{area_refresh: interval}}
+    {:ok,
+     %{
+       area_refresh: Keyword.get(ha, :area_refresh, :timer.hours(3)),
+       ha_timeout: Keyword.get(ha, :timeout, 10_000)
+     }}
   end
 
   @impl true
@@ -100,12 +109,12 @@ defmodule Home.Registry do
   end
 
   def handle_call(:refresh_area, _from, state) do
-    {:reply, do_refresh(), state}
+    {:reply, do_refresh(state), state}
   end
 
   @impl true
   def handle_info(:refresh_area, state) do
-    _ = do_refresh()
+    _ = do_refresh(state)
     Process.send_after(self(), :refresh_area, state.area_refresh)
     {:noreply, state}
   end
@@ -133,6 +142,19 @@ defmodule Home.Registry do
   # Lease and hardware changes alter a capability's status: drop the cached info.
   def handle_info({:lease, _event, %{cap: cap}}, state), do: invalidate(cap, state)
   def handle_info({:hardware, cap, _}, state), do: invalidate(cap, state)
+
+  # Another node moved: its capabilities report a new area.
+  def handle_info({:area_changed, peer, _area}, state) when peer != node() do
+    :ets.select_delete(@table, [{{{:info, :"$1"}, :_, :_}, [{:==, {:node, :"$1"}, peer}], [true]}])
+
+    {:noreply, state}
+  end
+
+  def handle_info({:secrets_changed, keys}, state) do
+    if :ha_url in keys or :ha_token in keys, do: _ = do_refresh(state)
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   defp invalidate(cap, state) do
@@ -140,10 +162,11 @@ defmodule Home.Registry do
     {:noreply, state}
   end
 
-  defp do_refresh do
+  defp do_refresh(state) do
     with {:ok, url} <- Home.Secrets.fetch(:ha_url),
          {:ok, token} <- Home.Secrets.fetch(:ha_token),
-         {:ok, area} <- Home.HA.Client.area_for_device(url, token, device_id()) do
+         {:ok, area} <-
+           Home.HA.Client.area_for_device(url, token, device_id(), timeout: state.ha_timeout) do
       if area != area(), do: store_area(area)
       {:ok, area}
     else
@@ -158,16 +181,22 @@ defmodule Home.Registry do
 
   defp store_area(area) do
     :ets.insert(@table, {:area, area})
-    File.write!(area_file(), :erlang.term_to_binary(area))
+    tmp = area_file() <> ".tmp"
+    File.write!(tmp, :erlang.term_to_binary(area))
+    File.rename!(tmp, area_file())
     :ets.match_delete(@table, {{:info, :_}, :_, :_})
     Phoenix.PubSub.broadcast(Home.PubSub, "registry", {:area_changed, node(), area})
   end
 
   defp read_area do
-    case File.read(area_file()) do
-      {:ok, bin} -> :erlang.binary_to_term(bin)
+    with {:ok, bin} <- File.read(area_file()),
+         area when is_binary(area) <- :erlang.binary_to_term(bin) do
+      area
+    else
       _ -> nil
     end
+  rescue
+    ArgumentError -> nil
   end
 
   defp area_file, do: Path.join(Home.data_dir(), "area")
