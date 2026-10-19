@@ -17,6 +17,7 @@ defmodule Home do
     * `:cluster` - `[backend: module | {module, opts}, interval: ms]`. Default `Home.Cluster.Epmd`.
     * `:data_dir` - where secrets, area and other node state persist.
     * `:media` - `[ip: ip_tuple, ports: first..last]`, the address and UDP range media is received on.
+    * `:render` - `[asset_tcp_threshold: bytes, ip: ip_tuple, asset_ports: range]`, see `Home.Render.AssetTransfer`.
     * `:ha` - `[area_refresh: ms, timeout: ms]`. HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).
     * `:watchdog_interval` - lease watchdog sweep interval in ms.
     * `:activity` - `[ring: n]`, how many recent events to keep per capability and kind (64).

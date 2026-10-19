@@ -91,9 +91,22 @@ directory at their logical paths. That directory is B's renderer
 needs no tree rewrite. Fonts go before the renderer starts, images before the tree
 that uses them (messages between two processes are ordered).
 
-Not forwarded: `{:path, abs}` runtime paths and `{:id, _}` preloaded images (local to
-A by definition). Large files go over distribution in one message; the §6.1 "TCP
-socket if large" path is not built.
+Runtime paths (`{:path, abs}`) and preloaded ids (`{:id, "img_<sha256>"}`, emerge's
+canonical id for an image's bytes) only mean something on A. `Home.Render.Remote`
+rewrites them, before emerge diffs the tree, to logical paths named by content hash
+(`_home/<sha256>.<ext>`; `.svg` sniffed for ids), and the session sends those files by
+hash like the rest (`Home.Render.Assets`). A runtime path's hash is cached by size,
+mtime and inode; replacing the file shows the new image on the next render. Bytes for
+ids are kept on A with `Home.Render.Assets.put_image/1`, which returns the id (emerge
+0.5.0 has no public API for registering image bytes, so these ids are only usable
+through forwarding for now). The app's own tree is untouched.
+
+Assets of `asset_tcp_threshold` bytes or more (default 256 KiB, `config :home_base,
+render: [...]`) go over a TCP side channel instead of one distribution message
+(`Home.Render.AssetTransfer`): B listens on its render address (`:ip`, default the
+media IP; `:asset_ports`, default ephemeral) for one connection with a one-time token,
+checks size and sha256 while writing to its cache, and acks; A then sends a `link`
+message, which keeps the ordering "assets before the tree that uses them".
 
 ## Emerge changes (prototyped in `/root/workspace/emerge-home`, patch in `emerge-scene-forwarding.patch`)
 

@@ -12,7 +12,8 @@ defmodule Home.Render.Compositor do
   one tree per renderer, so a session that becomes top gets a fresh renderer (with its
   own fonts and asset directory) and is asked for a full tree.
 
-  Assets are cached on disk under `<data_dir>/render/assets/<sha256>`; each session
+  Assets are cached on disk under `<data_dir>/render/assets/<sha256>` (large ones arrive
+  over TCP, `Home.Render.AssetTransfer`); each session
   gets a directory of its logical paths linked into that cache, which is the
   renderer's `assets.sources`.
   """
@@ -47,6 +48,16 @@ defmodule Home.Render.Compositor do
 
   def put_asset(comp, session, logical, hash, data),
     do: send(comp, {:asset, session, logical, hash, data})
+
+  @doc """
+  Get ready to receive a large asset over TCP (`Home.Render.AssetTransfer`). Returns
+  `{:ok, {ip, port, token}}`; once the transfer is acked, the session sends `link/4`.
+  """
+  def receive_asset(comp, session, hash, size),
+    do: GenServer.call(comp, {:receive_asset, session, hash, size})
+
+  @doc "Link an asset already in the cache (received over TCP) at `logical` for `session`."
+  def link(comp, session, logical, hash), do: send(comp, {:link, session, logical, hash})
 
   def upload(comp, session, bin), do: send(comp, {:upload, session, bin})
   def patch(comp, session, bin), do: send(comp, {:patch, session, bin})
@@ -120,8 +131,16 @@ defmodule Home.Render.Compositor do
       |> Enum.filter(fn {logical, _} -> safe_logical?(logical) end)
       |> Enum.split_with(fn {_, hash} -> File.regular?(cache_path(state, hash)) end)
 
-    Enum.each(present, fn {logical, hash} -> link(state, entry, logical, hash) end)
+    Enum.each(present, fn {logical, hash} -> link_file(state, entry, logical, hash) end)
     {:reply, absent |> Enum.map(&elem(&1, 1)) |> Enum.uniq(), state}
+  end
+
+  def handle_call({:receive_asset, pid, hash, size}, _from, state) do
+    if Map.has_key?(state.sessions, pid) and valid_hash?(hash) and is_integer(size) do
+      {:reply, Home.Render.AssetTransfer.listen(hash, size, cache_path(state, hash)), state}
+    else
+      {:reply, {:error, :unknown_session}, state}
+    end
   end
 
   def handle_call(:shown, _from, state), do: {:reply, top(state), state}
@@ -148,9 +167,21 @@ defmodule Home.Render.Compositor do
       tmp = path <> ".tmp#{System.unique_integer([:positive])}"
       File.write!(tmp, data)
       File.rename!(tmp, path)
-      link(state, entry, logical, hash)
+      link_file(state, entry, logical, hash)
     else
       _ -> Logger.warning("render: dropped asset #{inspect(logical)} from #{inspect(pid)}")
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:link, pid, logical, hash}, state) do
+    with %{} = entry <- state.sessions[pid],
+         true <- safe_logical?(logical) and valid_hash?(hash),
+         true <- File.regular?(cache_path(state, hash)) do
+      link_file(state, entry, logical, hash)
+    else
+      _ -> Logger.warning("render: cannot link asset #{inspect(logical)} for #{inspect(pid)}")
     end
 
     {:noreply, state}
@@ -345,7 +376,7 @@ defmodule Home.Render.Compositor do
     }
   end
 
-  defp link(state, entry, logical, hash) do
+  defp link_file(state, entry, logical, hash) do
     dest = Path.join(entry.dir, logical)
     File.mkdir_p!(Path.dirname(dest))
     File.rm(dest)
@@ -361,6 +392,8 @@ defmodule Home.Render.Compositor do
   end
 
   defp safe_logical?(_), do: false
+
+  defp valid_hash?(hash), do: is_binary(hash) and hash =~ ~r/\A[0-9a-f]{64}\z/
 
   @doc false
   def hash(data), do: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
