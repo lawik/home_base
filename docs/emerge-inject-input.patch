@@ -1,0 +1,373 @@
+From ada4c6d3d42161aaaac04ecab2fbc355fcbaa532 Mon Sep 17 00:00:00 2001
+From: Lars Wikman <lars@underjord.io>
+Date: Mon, 19 Oct 2026 15:31:28 +0000
+Subject: [PATCH] Inject raw input into a running renderer
+ (EmergeSkia.inject_input/2)
+
+A renderer only took input from its own backend (and the test harness had its
+own cursor NIF). renderer_inject_input decodes the raw input terms the renderer
+emits and sends them to its event actor, so hit-testing, element events, focus,
+scrolling and raw-input delivery work for input received elsewhere, for any
+backend including headless. Needs a native rebuild. The macOS host returns
+{:error, :unsupported}.
+---
+ lib/emerge_skia.ex                      |  25 +++++
+ lib/emerge_skia/native.ex               |   7 ++
+ lib/emerge_skia/transport.ex            |   1 +
+ lib/emerge_skia/transport/macos_host.ex |   5 +
+ lib/emerge_skia/transport/native.ex     |   7 ++
+ native/emerge_skia/src/input.rs         | 121 ++++++++++++++++++++++++
+ native/emerge_skia/src/lib.rs           |  21 ++++
+ test/emerge_skia/inject_input_test.exs  |  69 ++++++++++++++
+ 8 files changed, 256 insertions(+)
+ create mode 100644 test/emerge_skia/inject_input_test.exs
+
+diff --git a/lib/emerge_skia.ex b/lib/emerge_skia.ex
+index 5806c2b..21f1b44 100644
+--- a/lib/emerge_skia.ex
++++ b/lib/emerge_skia.ex
+@@ -761,6 +761,31 @@ defmodule EmergeSkia do
+     |> apply(:set_input_target, [renderer, pid])
+   end
+ 
++  @doc """
++  Feed a raw input event into a running renderer, as if its backend had produced it.
++
++  `event` has the shape the renderer itself reports raw input in (see
++  `set_input_target/2`): `{:cursor_pos, {x, y}}`,
++  `{:cursor_button, {button, action, mods, {x, y}}}`,
++  `{:cursor_scroll, {{dx, dy}, {x, y}}}`, `{:touch, {id, :down | :move | :up | :cancel, {x, y}}}`,
++  `{:key, {key, action, mods}}`, `{:text_commit, {text, mods}}`,
++  `{:cursor_entered, boolean}` or `{:focused, boolean}`. Coordinates are in the
++  renderer's logical pixels and may be integers; `action` may also be `:press` or
++  `:release`.
++
++  The renderer hit-tests it against its tree and handles it like native input:
++  element events (`on_press`, `on_click`, focus, text editing, scrolling) are sent to
++  the input target, and raw input passes the input mask. This lets input received
++  elsewhere, for example on another machine's display, drive a headless renderer.
++
++  Returns `{:error, :invalid_event}` for an unknown shape and `{:error, :unsupported}`
++  on the macOS host.
++  """
++  @spec inject_input(renderer(), tuple()) :: :ok | {:error, term()}
++  def inject_input(renderer, event) when is_tuple(event) do
++    Transport.for_renderer(renderer).inject_input(renderer, event)
++  end
++
+   @doc """
+   Set the target process to receive native renderer log messages.
+ 
+diff --git a/lib/emerge_skia/native.ex b/lib/emerge_skia/native.ex
+index 183c554..1a5914d 100644
+--- a/lib/emerge_skia/native.ex
++++ b/lib/emerge_skia/native.ex
+@@ -386,6 +386,13 @@ defmodule EmergeSkia.Native do
+   @spec set_input_target(reference(), pid() | nil) :: :ok
+   def set_input_target(_renderer, _pid), do: :erlang.nif_error(:nif_not_loaded)
+ 
++  @doc """
++  Feed a raw input event (the shape the renderer sends as
++  `{:emerge_skia_event, event}`) into the renderer's event actor.
++  """
++  @spec renderer_inject_input(reference(), tuple()) :: :ok
++  def renderer_inject_input(_renderer, _event), do: :erlang.nif_error(:nif_not_loaded)
++
+   @doc """
+   Set the target process to receive native renderer log messages.
+ 
+diff --git a/lib/emerge_skia/transport.ex b/lib/emerge_skia/transport.ex
+index 210c66e..83e37fb 100644
+--- a/lib/emerge_skia/transport.ex
++++ b/lib/emerge_skia/transport.ex
+@@ -20,6 +20,7 @@ defmodule EmergeSkia.Transport do
+   @callback capture_pixels(renderer_handle(), map()) :: {:ok, binary()} | {:error, term()}
+   @callback capture_png(renderer_handle(), map()) :: {:ok, binary()} | {:error, term()}
+   @callback set_input_mask(renderer_handle(), non_neg_integer()) :: :ok
++  @callback inject_input(renderer_handle(), tuple()) :: :ok | {:error, term()}
+   @callback upload_tree(renderer_handle(), binary()) :: :ok | {:error, term()}
+   @callback patch_tree(renderer_handle(), binary()) :: :ok | {:error, term()}
+   @callback measure_text(String.t(), float()) :: {float(), float(), float(), float()}
+diff --git a/lib/emerge_skia/transport/macos_host.ex b/lib/emerge_skia/transport/macos_host.ex
+index d06bdda..e832360 100644
+--- a/lib/emerge_skia/transport/macos_host.ex
++++ b/lib/emerge_skia/transport/macos_host.ex
+@@ -55,6 +55,11 @@ defmodule EmergeSkia.Transport.MacosHost do
+     Host.set_input_mask(renderer, mask)
+   end
+ 
++  # The macOS host owns its event loop in another OS process; its protocol has no
++  # input message yet.
++  @impl true
++  def inject_input(_renderer, _event), do: {:error, :unsupported}
++
+   @impl true
+   def upload_tree(renderer, full_bin) do
+     Host.upload_tree(renderer, full_bin)
+diff --git a/lib/emerge_skia/transport/native.ex b/lib/emerge_skia/transport/native.ex
+index 597f4f0..17fb7e5 100644
+--- a/lib/emerge_skia/transport/native.ex
++++ b/lib/emerge_skia/transport/native.ex
+@@ -68,6 +68,13 @@ defmodule EmergeSkia.Transport.Native do
+     Native.set_input_mask(native_renderer(renderer), mask)
+   end
+ 
++  @impl true
++  def inject_input(renderer, event) do
++    Native.renderer_inject_input(native_renderer(renderer), event)
++  rescue
++    ArgumentError -> {:error, :invalid_event}
++  end
++
+   @impl true
+   def upload_tree(renderer, full_bin) do
+     Native.renderer_upload(native_renderer(renderer), full_bin)
+diff --git a/native/emerge_skia/src/input.rs b/native/emerge_skia/src/input.rs
+index 3c7be0f..fec0aaa 100644
+--- a/native/emerge_skia/src/input.rs
++++ b/native/emerge_skia/src/input.rs
+@@ -329,6 +329,8 @@ rustler::atoms! {
+     ctrl,
+     alt,
+     meta,
++    press,
++    release,
+ }
+ 
+ // ============================================================================
+@@ -503,6 +505,125 @@ impl Encoder for InputEvent {
+     }
+ }
+ 
++// ============================================================================
++// Decoder Implementation (injected input)
++// ============================================================================
++
++/// Decodes the raw input terms this module encodes (`{:cursor_pos, {x, y}}`,
++/// `{:cursor_button, {button, action, mods, {x, y}}}`, ...), so input received
++/// elsewhere can be fed into a running renderer. Coordinates may be integers or
++/// floats; actions may be `0`/`1` or `:release`/`:press`. Window-system events
++/// (`resized`, IME preedit) are not accepted.
++impl<'a> rustler::Decoder<'a> for InputEvent {
++    fn decode(term: Term<'a>) -> rustler::NifResult<Self> {
++        let (tag, payload): (Atom, Term<'a>) = term.decode()?;
++
++        if tag == cursor_pos() {
++            let (x, y) = decode_point(payload)?;
++            Ok(InputEvent::CursorPos { x, y })
++        } else if tag == cursor_button() {
++            let (button, action, mods, point): (Atom, Term<'a>, Term<'a>, Term<'a>) =
++                payload.decode()?;
++            let (x, y) = decode_point(point)?;
++            let button = button.to_term(term.get_env()).atom_to_string()?;
++            Ok(InputEvent::CursorButton {
++                button: pointer::canonical_button_label(&button).to_string(),
++                action: decode_action(action)?,
++                mods: decode_mods(mods)?,
++                x,
++                y,
++            })
++        } else if tag == cursor_scroll() {
++            let (delta, point): (Term<'a>, Term<'a>) = payload.decode()?;
++            let (dx, dy) = decode_point(delta)?;
++            let (x, y) = decode_point(point)?;
++            Ok(InputEvent::CursorScroll { dx, dy, x, y })
++        } else if tag == key() {
++            let (key_atom, action, mods): (Atom, Term<'a>, Term<'a>) = payload.decode()?;
++            let name = key_atom.to_term(term.get_env()).atom_to_string()?;
++            Ok(InputEvent::Key {
++                key: CanonicalKey::from_atom_name(&name).unwrap_or(CanonicalKey::Unknown),
++                action: decode_action(action)?,
++                mods: decode_mods(mods)?,
++            })
++        } else if tag == text_commit() {
++            let (text, mods): (String, Term<'a>) = payload.decode()?;
++            Ok(InputEvent::TextCommit {
++                text,
++                mods: decode_mods(mods)?,
++            })
++        } else if tag == touch() {
++            let (id, phase, point): (u64, Atom, Term<'a>) = payload.decode()?;
++            let (x, y) = decode_point(point)?;
++            let phase = if phase == down() {
++                TouchPhase::Down
++            } else if phase == move_touch() {
++                TouchPhase::Move
++            } else if phase == up() {
++                TouchPhase::Up
++            } else if phase == cancel() {
++                TouchPhase::Cancel
++            } else {
++                return Err(rustler::Error::BadArg);
++            };
++            Ok(InputEvent::Touch { id, phase, x, y })
++        } else if tag == cursor_entered() {
++            Ok(InputEvent::CursorEntered {
++                entered: payload.decode()?,
++            })
++        } else if tag == focused() {
++            Ok(InputEvent::Focused {
++                focused: payload.decode()?,
++            })
++        } else {
++            Err(rustler::Error::BadArg)
++        }
++    }
++}
++
++fn decode_number(term: Term<'_>) -> rustler::NifResult<f32> {
++    match term.decode::<f64>() {
++        Ok(value) => Ok(value as f32),
++        Err(_) => term.decode::<i64>().map(|value| value as f32),
++    }
++}
++
++fn decode_point(term: Term<'_>) -> rustler::NifResult<(f32, f32)> {
++    let (x, y): (Term<'_>, Term<'_>) = term.decode()?;
++    Ok((decode_number(x)?, decode_number(y)?))
++}
++
++fn decode_action(term: Term<'_>) -> rustler::NifResult<u8> {
++    if let Ok(action) = term.decode::<u8>() {
++        return Ok(action);
++    }
++    let action: Atom = term.decode()?;
++    if action == press() {
++        Ok(ACTION_PRESS)
++    } else if action == release() {
++        Ok(ACTION_RELEASE)
++    } else {
++        Err(rustler::Error::BadArg)
++    }
++}
++
++fn decode_mods(term: Term<'_>) -> rustler::NifResult<u8> {
++    let mods: Vec<Atom> = term.decode()?;
++    Ok(mods.into_iter().fold(0, |bits, modifier| {
++        bits | if modifier == shift() {
++            MOD_SHIFT
++        } else if modifier == ctrl() {
++            MOD_CTRL
++        } else if modifier == alt() {
++            MOD_ALT
++        } else if modifier == meta() {
++            MOD_META
++        } else {
++            0
++        }
++    }))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::keys::CanonicalKey;
+diff --git a/native/emerge_skia/src/lib.rs b/native/emerge_skia/src/lib.rs
+index 6863b2e..d91ce33 100644
+--- a/native/emerge_skia/src/lib.rs
++++ b/native/emerge_skia/src/lib.rs
+@@ -3845,6 +3845,27 @@ fn set_input_target(
+     atoms::ok()
+ }
+ 
++/// Feed a raw input event into the renderer's event actor, as if its backend had
++/// produced it: hit-testing, element events (`{:emerge_skia_event, {id, :press}}`
++/// and friends), focus, scrolling and raw-input delivery all run as for native
++/// input. Works with every backend, including headless.
++#[rustler::nif]
++fn renderer_inject_input(
++    renderer: ResourceArc<RendererResource>,
++    event: input::InputEvent,
++) -> NifResult<Atom> {
++    if !renderer.running_flag.load(Ordering::Acquire) {
++        return Err(rustler::Error::Term(Box::new("renderer is not running")));
++    }
++
++    send_event(
++        &renderer.event_tx,
++        EventMsg::InputEvent(event.normalize_scroll()),
++        renderer.log_input,
++    );
++    Ok(atoms::ok())
++}
++
+ #[rustler::nif]
+ fn set_log_target(renderer: ResourceArc<RendererResource>, pid: Option<LocalPid>) -> Atom {
+     renderer.native_log.set_target(pid);
+diff --git a/test/emerge_skia/inject_input_test.exs b/test/emerge_skia/inject_input_test.exs
+new file mode 100644
+index 0000000..13254c9
+--- /dev/null
++++ b/test/emerge_skia/inject_input_test.exs
+@@ -0,0 +1,69 @@
++defmodule EmergeSkia.InjectInputTest do
++  use ExUnit.Case, async: false
++  use Emerge.UI
++
++  alias Emerge.Config
++  alias Emerge.Engine.NodeId
++
++  setup do
++    config = %Config{
++      output: %Config.Headless{target: self(), size: {100, 60}},
++      renderer: [api: :raster],
++      input: [events: [:pointer_button, :key]],
++      assets: [otp_app: :emerge]
++    }
++
++    {:ok, renderer} = EmergeSkia.start(config)
++    on_exit(fn -> EmergeSkia.stop(renderer) end)
++    :ok = EmergeSkia.set_input_target(renderer, self())
++
++    tree =
++      row([width(fill()), height(fill())], [
++        el([key(:a), width(px(50)), height(fill()), Event.on_press(:a)], none()),
++        el([key(:b), width(px(50)), height(fill()), Event.on_press(:b)], none())
++      ])
++
++    {diff_state, assigned} = EmergeSkia.upload_tree(renderer, tree)
++    assert_receive {:emerge_skia_frame, _}, 5_000
++
++    ids =
++      Map.new(assigned.children, fn child -> {child.key, NodeId.encode(child.id)} end)
++
++    %{renderer: renderer, ids: ids, diff_state: diff_state}
++  end
++
++  test "an injected click is hit-tested into element events", %{renderer: renderer, ids: ids} do
++    b = ids.b
++
++    for event <- [
++          {:cursor_pos, {75, 30}},
++          {:cursor_button, {:left, :press, [], {75, 30}}},
++          {:cursor_button, {:left, 0, [], {75.0, 30.0}}}
++        ],
++        do: assert(:ok = EmergeSkia.inject_input(renderer, event))
++
++    assert_receive {:emerge_skia_event, {^b, :press}}, 2_000
++    refute_received {:emerge_skia_event, {_, :press}}
++
++    # Raw input passes the input mask as for native input.
++    assert_received {:emerge_skia_event, {:cursor_button, {:left, 1, [], {75.0, 30.0}}}}
++  end
++
++  test "keys and touch are accepted; unknown shapes are not", %{renderer: renderer, ids: ids} do
++    a = ids.a
++    assert :ok = EmergeSkia.inject_input(renderer, {:key, {:enter, 1, [:shift]}})
++    assert_receive {:emerge_skia_event, {:key, {:enter, 1, [:shift]}}}, 2_000
++
++    assert :ok = EmergeSkia.inject_input(renderer, {:touch, {7, :down, {10, 10}}})
++    assert :ok = EmergeSkia.inject_input(renderer, {:touch, {7, :up, {10, 10}}})
++    assert_receive {:emerge_skia_event, {^a, :press}}, 2_000
++
++    assert {:error, :invalid_event} = EmergeSkia.inject_input(renderer, {:resized, {1, 1, 1.0}})
++    assert {:error, :invalid_event} = EmergeSkia.inject_input(renderer, {:cursor_pos, :nope})
++  end
++
++  test "a stopped renderer refuses input", %{renderer: renderer} do
++    :ok = EmergeSkia.stop(renderer)
++    assert {:error, _} = EmergeSkia.inject_input(renderer, {:cursor_pos, {1, 1}})
++  end
++end
+-- 
+2.43.0
+

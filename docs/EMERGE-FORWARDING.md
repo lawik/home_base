@@ -110,8 +110,11 @@ message, which keeps the ordering "assets before the tree that uses them".
 
 ## Emerge changes (prototyped in `/root/workspace/emerge-home`, patch in `emerge-scene-forwarding.patch`)
 
-Both are small, Elixir-only (no NIF change, so the 0.5.0 precompiled NIF is used),
-and upstream-able:
+The first two are small, Elixir-only (no NIF change, so the 0.5.0 precompiled NIF is
+used), and upstream-able. The third needs a native rebuild; without it everything
+else works and only input injection (pixel-forwarded element events,
+`Compositor.inject/2`) is missing. Scroll/focus keeping, overlays and the asset
+work need no emerge change.
 
 1. **`EmergeSkia.upload_tree_binary/2` and `EmergeSkia.patch_tree_binary/2`**: public
    apply of already-encoded bytes. The transport functions exist
@@ -124,7 +127,8 @@ and upstream-able:
    resolve logical paths inside an OTP app's priv, so B could not draw A's assets
    without rewriting A's tree per display.
 
-3. **`EmergeSkia.inject_input/2`** (branch `home-m8-forwarding`, commit `ada4c6d`;
+3. **`EmergeSkia.inject_input/2`** (branch `home-m8-forwarding`, commit `ada4c6d`, also
+   as `docs/emerge-inject-input.patch`;
    **needs a native rebuild**): feed raw input (the shapes the renderer reports:
    `{:cursor_button, {button, action, mods, {x, y}}}`, `{:key, ...}`, ...) into a
    running renderer's event actor, as if its backend had produced it. Hit-testing,
