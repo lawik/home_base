@@ -31,7 +31,7 @@ defmodule Home.Media.SynthVideo do
     width: [spec: pos_integer(), default: 320, description: "Even, at least 280."],
     height: [spec: pos_integer(), default: 240, description: "Even."],
     fps: [spec: pos_integer(), default: 30, description: "Frames per second."],
-    notify: [spec: pid() | nil, default: nil, description: "Gets frame times."],
+    notify: [spec: Process.dest() | nil, default: nil, description: "Gets frame times."],
     cap: [spec: term(), default: nil, description: "Capability ref for notify."]
   )
 

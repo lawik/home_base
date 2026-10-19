@@ -5,7 +5,17 @@ defmodule Home.Media do
   `Home.Media.Supervisor` there.
 
   The node receives media on `Home.config(:media)`: `[ip: ip_tuple, ports: first..last]`,
-  default `127.0.0.1` and #{inspect(50_000..50_099)}.
+  default `127.0.0.1` and #{inspect(50_000..50_099)}. Sinks bind that address and
+  advertise it to the source.
+
+  Behind NAT the address a sink advertises may not be the one a source has to send to (a
+  qemu guest on user networking is reached through `hostfwd` on the host's 127.0.0.1). A
+  source node then rewrites destinations with `routes:`, the way `HomeNode.Epmd` routes
+  distribution: `%{advertised_ip => ip}` or `%{{advertised_ip, port} => {ip, port}}`
+  (exact matches first).
+
+      config :home_base, media: [ip: {127, 0, 0, 1}, ports: 41_430..41_439,
+                                 routes: %{{10, 0, 3, 15} => {127, 0, 0, 1}}]
   """
 
   @default_ports 50_000..50_099
@@ -84,9 +94,11 @@ defmodule Home.Media do
     opts = Map.new(opts)
     video? = Map.get(opts, :codec) == :h264
 
+    routes = Keyword.get(Home.config(:media, []), :routes, %{})
+
     opts =
       opts
-      |> Map.merge(%{endpoint: endpoint, destinations: destinations})
+      |> Map.merge(%{endpoint: endpoint, destinations: route(destinations, routes)})
       |> Map.put_new(:codec, :opus)
       |> Map.put_new(:kind, if(video?, do: :video_in, else: :audio_in))
       |> Map.put_new(:bitrate, if(video?, do: 3_000_000, else: 64_000))
@@ -94,6 +106,20 @@ defmodule Home.Media do
       |> Map.put_new(:gop_size, 30)
 
     start_pipeline(Home.Media.SourcePipeline, opts)
+  end
+
+  @doc """
+  Rewrite `[{ip, port}]` destinations with `routes` (see the moduledoc): an exact
+  `{ip, port}` route first, then one for the ip alone (which keeps the port).
+  """
+  def route(destinations, routes) do
+    for {ip, port} = dest <- destinations do
+      case routes do
+        %{^dest => {_ip, _port} = to} -> to
+        %{^ip => to} when is_tuple(to) and tuple_size(to) in [4, 8] -> {to, port}
+        _ -> dest
+      end
+    end
   end
 
   defp start_pipeline(module, opts) do

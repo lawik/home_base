@@ -4,7 +4,7 @@ defmodule Home.Adapters.Audio.SynthMic do
   silence with a click every `click_every` ms. For tests and for checking a path end to end.
 
   Capability meta: `:click_every`, `:click_ms`, `:tone_hz`, `:amplitude`, and `:notify` (a
-  pid that gets `{:synth_click, cap, wall_us}` per click and `{:home_hw, cap_id, :on | :off}`
+  pid or registered name that gets `{:synth_click, cap, wall_us}` per click and `{:home_hw, cap_id, :on | :off}`
   when the "hardware" turns on or off).
   """
 
@@ -31,8 +31,8 @@ defmodule Home.Adapters.Audio.SynthMic do
     struct!(Home.Media.SynthSource, Map.put(opts, :cap, {node(), cap.id}))
   end
 
-  defp notify(%{cap: %{id: id, meta: %{notify: pid}}}, what) when is_pid(pid),
-    do: send(pid, {:home_hw, id, what})
+  defp notify(%{cap: %{id: id, meta: %{notify: dest}}}, what) when dest != nil,
+    do: send(dest, {:home_hw, id, what})
 
   defp notify(_, _), do: :ok
 end

@@ -16,7 +16,7 @@ defmodule Home do
     * `:capabilities` - list of `Home.Capability` structs or maps. Or `:manifest` - `{:file, path}`.
     * `:cluster` - `[backend: module | {module, opts}, interval: ms]`. Default `Home.Cluster.Epmd`.
     * `:data_dir` - where secrets, area and other node state persist.
-    * `:media` - `[ip: ip_tuple, ports: first..last]`, the address and UDP range media is received on.
+    * `:media` - `[ip: ip_tuple, ports: first..last, routes: %{}]`, the address and UDP range media is received on, and destination rewrites for NAT (`Home.Media`).
     * `:ha` - `[area_refresh: ms, timeout: ms]`. HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`).
     * `:watchdog_interval` - lease watchdog sweep interval in ms.
     * `:activity` - `[ring: n]`, how many recent events to keep per capability and kind (64).

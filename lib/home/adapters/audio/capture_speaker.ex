@@ -4,7 +4,7 @@ defmodule Home.Adapters.Audio.CaptureSpeaker do
   sound card's output queue, detects click onsets and reports them with wall-clock times, so
   latency can be measured on one host.
 
-  Capability meta: `:notify` (pid for `{:capture_onset, cap, wall_us}` and friends, see
+  Capability meta: `:notify` (pid or registered name for `{:capture_onset, cap, wall_us}` and friends, see
   `Home.Media.CaptureSink`), `:threshold`, `:quiet_ms`, `:record` (path to append PCM to).
   """
 

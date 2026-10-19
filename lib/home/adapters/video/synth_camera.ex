@@ -4,7 +4,7 @@ defmodule Home.Adapters.Video.SynthCamera do
   I420 test pattern with the frame number drawn in. For tests and for checking a video
   path end to end without a camera.
 
-  Capability meta: `:w`, `:h`, `:fps`, and `:notify` (a pid that gets
+  Capability meta: `:w`, `:h`, `:fps`, and `:notify` (a pid or registered name that gets
   `{:synth_frame, cap, n, wall_us}` per frame and `{:home_hw, cap_id, :on | :off}` when
   the "hardware" turns on or off).
   """
@@ -37,8 +37,8 @@ defmodule Home.Adapters.Video.SynthCamera do
     }
   end
 
-  defp notify(%{cap: %{id: id, meta: %{notify: pid}}}, what) when is_pid(pid),
-    do: send(pid, {:home_hw, id, what})
+  defp notify(%{cap: %{id: id, meta: %{notify: dest}}}, what) when dest != nil,
+    do: send(dest, {:home_hw, id, what})
 
   defp notify(_, _), do: :ok
 end
