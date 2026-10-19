@@ -87,15 +87,37 @@ readable in B's latest headless frame (polled every ~2 ms), same wall clock:
 
 | case | frames shown | median | p95 | max |
 |---|---|---|---|---|
-| 320x240 @ 30 fps | 87 of 90 in 3 s | 71 ms | 73 ms | 74 ms |
-| 1280x720 @ 30 fps, 3 Mbps cap | 87 of 90 in 3 s | 82 ms | 96 ms | 98 ms |
-| pixel forwarding: click on B -> app on A -> new colour on B (320x240) | 6 rounds | 99 ms | | 99 ms |
+| 320x240 @ 30 fps | 89 of 90 in 3 s | 6 ms | 7 ms | 17 ms |
+| 1280x720 @ 30 fps, 3 Mbps cap | 89 of 90 in 3 s | 27 ms | 30 ms | 57 ms |
+| pixel forwarding: click on B -> app on A -> new colour on B (320x240) | 6 rounds | 33 ms | | 33 ms |
 
-Target is <= 250 ms (§5.3). The 3 frames "missing" are the ones in flight when the 3 s
-window closes. The jitter buffer only holds packets on a sequence gap: a run with
-`jitter: 0` measured the same 71 ms. One known frame (33 ms) is the receiver's H.264
-parser waiting for the next access unit before it emits one (the RTP depayloader drops
-the marker bit that ends an AU); an AU-from-marker filter would save it.
+Target is <= 250 ms (§5.3). The frame "missing" is the one in flight when the 3 s window
+closes. The jitter buffer only holds packets on a sequence gap.
+
+Before access units were cut on the RTP marker the same cases measured 71/72 ms, 82-92 ms
+and 99 ms: `Membrane.RTP.H264.Payloader` held each frame's small NAL units in a STAP-A
+until the next frame's first one arrived, and on the receiver `Membrane.H264.Parser`
+waited for the next access unit too (the stock depayloader copies a STAP-A's marker
+onto every NAL unit in it, so the marker couldn't be used there). `Home.Media.H264Payloader`
+sends each access unit at once with the marker on its last packet, and
+`Home.Media.H264Depayloader` hands each access unit on when its marker arrives: two
+frame intervals less at 320x240, where whole frames fit in one STAP-A.
+
+### Loss (`test/media_resilience_test.exs`, `Home.Test.LossyRelay` between source and sink)
+
+RTCP runs on the RTP ports (`Home.Media.RTCP`): SRs from the source, RRs, generic NACKs
+and PLIs from each sink. `Home.Media.Session.stats/1` has both ends' view.
+
+| case | feedback | result |
+|---|---|---|
+| 320x240 video, gop 90, 200 ms blackout | none | first frame 1.64 s after the blackout (next periodic keyframe) |
+| same | PLI | 74 ms (one forced keyframe) |
+| same | NACK + PLI | 10-18 ms (the lost packets are resent; no keyframe needed) |
+| audio, 5% random loss, 8 ms jitter | none | 7 of 199 packets lost, RR fraction 0.059, jitter 3.9 ms |
+| same | NACK | 0 of 199 lost (7 resent and recovered), RTT ~8 ms (incl. relay delay) |
+
+After a loss the receiver drops frames until a keyframe (a frozen picture rather than a
+smeared one) and sends a PLI, repeated every 250 ms while it waits.
 
 ## Limits / not done
 
@@ -107,13 +129,16 @@ the marker bit that ends an AU); an AU-from-marker filter would save it.
   remains the way to get element events remotely.
 * Pixel forwarding renders at the display's size, so pointer coordinates map 1:1. A
   display without `meta.w/h` gets 800x600 and letterboxed coordinates are not mapped.
-* `move/2` is not supported for video sessions (`{:error, :not_supported}`); the
-  receiving pipeline lives on the display node, so it would be a new media session.
+* `move/2` on a video adds the new display to the media session (the source forces a
+  keyframe once the new sink's endpoint is linked) and then removes the old one: first
+  frame on the new display ~12 ms after the call, the camera keeps running. A pixel app
+  keeps rendering at the first display's size.
 * A forwarded app can contain its own `video/2` element, and the compositor will feed
   any session's target from `Compositor.video_frame/4`, but there is no API yet to aim a
   camera at an element of a scene-forwarded app (it would have to follow `move/2`).
-* No RTCP, no NACK/PLI: a lost packet corrupts video until the next keyframe (gop 30 = 1
-  s). Fine on a LAN/tailnet; revisit with RTCP if DERP paths are common.
+* Retransmissions resend the same packets (no RTX stream, RFC 4588), and only within
+  the jitter buffer's wait (`jitter`, 40 ms); there is no congestion control (REMB/TWCC)
+  and no FEC.
 * The bitrate is a VBV cap on CRF (`maxrate`/`bufsize` = bitrate/2), not a target; the
   synthetic pattern is far below it.
 * Hardware H.264 (rpicam-vid / V4L2 M2M on the Pi) is not wired; the encoder is x264.
