@@ -1,0 +1,249 @@
+diff -ruN a/lib/emerge/config/assets.ex b/lib/emerge/config/assets.ex
+--- a/lib/emerge/config/assets.ex	2026-10-19 14:06:21.751380755 +0000
++++ b/lib/emerge/config/assets.ex	2026-10-19 14:13:03.193835534 +0000
+@@ -22,6 +22,10 @@
+   - `decode_at_size` — `false` by default. With `true`, raster images are decoded
+     near their drawn size rather than always retaining the source dimensions.
+     Useful for thumbnails of large images; larger targets can request a larger decode.
++  - `sources` — extra absolute directories searched for logical asset paths
++    (images and fonts) after the `otp_app`'s `priv/`; defaults to `[]`. Lets a
++    renderer draw a tree whose assets live outside any application, such as a
++    cache of assets received from another node.
+   - `runtime_paths` — `Emerge.Config.RuntimePaths`. Its default disables images
+     loaded from absolute filesystem paths.
+   - `cache` — `Emerge.Config.AssetCache`, limiting retained image pixels and parsed
+@@ -34,6 +38,7 @@
+   defstruct otp_app: nil,
+             fonts: [],
+             decode_at_size: false,
++            sources: [],
+             runtime_paths: %Emerge.Config.RuntimePaths{},
+             cache: %Emerge.Config.AssetCache{}
+ 
+@@ -41,6 +46,7 @@
+           otp_app: atom() | nil,
+           fonts: [Emerge.Config.Font.t() | Emerge.Config.Font.options()],
+           decode_at_size: boolean(),
++          sources: [String.t()],
+           runtime_paths: Emerge.Config.RuntimePaths.t() | Emerge.Config.RuntimePaths.options(),
+           cache: Emerge.Config.AssetCache.t() | Emerge.Config.AssetCache.options()
+         }
+@@ -49,6 +55,7 @@
+           {:otp_app, atom() | nil}
+           | {:fonts, [Emerge.Config.Font.t() | Emerge.Config.Font.options()]}
+           | {:decode_at_size, boolean()}
++          | {:sources, [String.t()]}
+           | {:runtime_paths,
+              Emerge.Config.RuntimePaths.t() | Emerge.Config.RuntimePaths.options()}
+           | {:cache, Emerge.Config.AssetCache.t() | Emerge.Config.AssetCache.options()}
+@@ -58,6 +65,7 @@
+           otp_app: atom() | nil,
+           fonts: [Emerge.Config.Font.normalized_t()],
+           decode_at_size: boolean(),
++          sources: [String.t()],
+           runtime_paths: Emerge.Config.RuntimePaths.normalized_t(),
+           cache: Emerge.Config.AssetCache.normalized_t()
+         }
+@@ -68,6 +76,7 @@
+       otp_app: {:optional, :module},
+       fonts: {:list, {:record, Emerge.Config.Font}},
+       decode_at_size: :boolean,
++      sources: {:list, :string},
+       runtime_paths: {:record, Emerge.Config.RuntimePaths},
+       cache: {:record, Emerge.Config.AssetCache}
+     ]
+diff -ruN a/lib/emerge/config/native.ex b/lib/emerge/config/native.ex
+--- a/lib/emerge/config/native.ex	2026-10-19 14:06:21.751380755 +0000
++++ b/lib/emerge/config/native.ex	2026-10-19 14:13:03.193835534 +0000
+@@ -49,6 +49,7 @@
+       assets: [
+         fonts: Enum.map(assets.fonts, &fields/1),
+         decode_at_size: assets.decode_at_size,
++        sources: assets.sources,
+         runtime_paths: fields(assets.runtime_paths),
+         cache: fields(assets.cache)
+       ]
+diff -ruN a/lib/emerge_skia/assets.ex b/lib/emerge_skia/assets.ex
+--- a/lib/emerge_skia/assets.ex	2026-10-19 14:06:21.756380730 +0000
++++ b/lib/emerge_skia/assets.ex	2026-10-19 14:13:03.194835531 +0000
+@@ -16,6 +16,7 @@
+   @type config :: %{
+           otp_app: atom(),
+           priv_dir: String.t(),
++          sources: [String.t()],
+           runtime_enabled: boolean(),
+           runtime_allowlist: [String.t()],
+           runtime_follow_symlinks: boolean(),
+@@ -107,6 +108,11 @@
+       |> Keyword.get(:decode_at_size, Keyword.get(defaults, :decode_at_size, false))
+       |> Options.normalize_boolean!("assets.decode_at_size")
+ 
++    sources =
++      assets_opts
++      |> Keyword.get(:sources, [])
++      |> normalize_path_list!("assets.sources")
++
+     runtime_enabled = Keyword.get(runtime_opts, :enabled, false)
+     runtime_follow_symlinks = Keyword.get(runtime_opts, :follow_symlinks, false)
+ 
+@@ -125,6 +131,7 @@
+     %{
+       otp_app: otp_app,
+       priv_dir: otp_app_priv_dir!(otp_app),
++      sources: sources,
+       runtime_enabled: runtime_enabled,
+       runtime_allowlist: runtime_allowlist,
+       runtime_follow_symlinks: runtime_follow_symlinks,
+@@ -151,7 +158,7 @@
+   @spec native_start_asset_config(config()) :: map()
+   def native_start_asset_config(asset_config) do
+     %{
+-      asset_sources: [asset_config.priv_dir],
++      asset_sources: sources(asset_config),
+       asset_runtime_enabled: asset_config.runtime_enabled,
+       asset_allowlist: asset_config.runtime_allowlist,
+       asset_follow_symlinks: asset_config.runtime_follow_symlinks,
+@@ -166,6 +173,17 @@
+   end
+ 
+   @doc false
++  @spec sources(config()) :: [String.t()]
++  def sources(asset_config), do: [asset_config.priv_dir | Map.get(asset_config, :sources, [])]
++
++  @doc false
++  @spec source_path(config(), String.t()) :: String.t()
++  def source_path(asset_config, logical) do
++    candidates = Enum.map(sources(asset_config), &Path.join(&1, logical))
++    Enum.find(candidates, hd(candidates), &File.regular?/1)
++  end
++
++  @doc false
+   @spec normalize_drm_cursor_overrides!(keyword()) :: [drm_cursor_override()]
+   def normalize_drm_cursor_overrides!(opts) do
+     opts
+@@ -177,9 +195,9 @@
+   @spec preload_font_assets(reference(), config(), module()) :: :ok | {:error, term()}
+   def preload_font_assets(_renderer, %{fonts: []}, _transport), do: :ok
+ 
+-  def preload_font_assets(renderer, %{fonts: fonts, priv_dir: priv_dir}, transport) do
++  def preload_font_assets(renderer, %{fonts: fonts} = asset_config, transport) do
+     Enum.reduce_while(fonts, :ok, fn font, :ok ->
+-      absolute_path = Path.join(priv_dir, font.source)
++      absolute_path = source_path(asset_config, font.source)
+ 
+       case File.read(absolute_path) do
+         {:ok, data} ->
+diff -ruN a/lib/emerge_skia/macos/protocol.ex b/lib/emerge_skia/macos/protocol.ex
+--- a/lib/emerge_skia/macos/protocol.ex	2026-10-19 14:06:21.756380730 +0000
++++ b/lib/emerge_skia/macos/protocol.ex	2026-10-19 14:13:03.195835528 +0000
+@@ -172,7 +172,6 @@
+         asset_config
+       ) do
+     title = IO.iodata_to_binary(title)
+-    priv_dir = Map.fetch!(asset_config, :priv_dir)
+     asset_payload = encode_asset_config(asset_config)
+     fonts = Map.fetch!(asset_config, :fonts)
+     renderer_stats_log = if renderer_stats_log, do: 1, else: 0
+@@ -182,7 +181,7 @@
+       height::unsigned-big-32, always_on_top, scroll_line_pixels::float-big-32,
+       renderer_stats_log, encode_renderer_cache_config(renderer_cache)::binary,
+       encode_rendering_api_tag(rendering_api), asset_payload::binary,
+-      encode_fonts(fonts, priv_dir)::binary>>
++      encode_fonts(fonts, asset_config)::binary>>
+   end
+ 
+   defp encode_renderer_cache_config(renderer_cache) do
+@@ -228,7 +227,7 @@
+     asset_mode = encode_asset_mode(Map.fetch!(raster_opts, :asset_mode))
+     asset_timeout_ms = Map.fetch!(raster_opts, :asset_timeout_ms)
+     asset_payload = encode_asset_config(asset_config)
+-    fonts = encode_fonts(Map.fetch!(asset_config, :fonts), Map.fetch!(asset_config, :priv_dir))
++    fonts = encode_fonts(Map.fetch!(asset_config, :fonts), asset_config)
+ 
+     <<byte_size(tree)::unsigned-big-32, tree::binary,
+       Map.fetch!(raster_opts, :width)::unsigned-big-32,
+@@ -251,8 +250,7 @@
+   def format_socket_error(reason), do: "macOS host socket error: #{inspect(reason)}"
+ 
+   defp encode_asset_config(asset_config) do
+-    priv_dir = Map.fetch!(asset_config, :priv_dir)
+-    sources = [priv_dir]
++    sources = EmergeSkia.Assets.sources(asset_config)
+     allowlist = Map.fetch!(asset_config, :runtime_allowlist)
+     extensions = Map.fetch!(asset_config, :runtime_extensions)
+     runtime_enabled = if Map.fetch!(asset_config, :runtime_enabled), do: 1, else: 0
+@@ -323,11 +321,11 @@
+     IO.iodata_to_binary([<<length(list)::unsigned-big-32>>, encoded])
+   end
+ 
+-  defp encode_fonts(fonts, priv_dir) when is_list(fonts) and is_binary(priv_dir) do
++  defp encode_fonts(fonts, asset_config) when is_list(fonts) do
+     encoded =
+       Enum.map(fonts, fn font ->
+         family = Map.fetch!(font, :family)
+-        path = Path.join(priv_dir, Map.fetch!(font, :source))
++        path = EmergeSkia.Assets.source_path(asset_config, Map.fetch!(font, :source))
+         weight = Map.fetch!(font, :weight)
+         italic = if Map.fetch!(font, :italic), do: 1, else: 0
+ 
+diff -ruN a/lib/emerge_skia/transport/native.ex b/lib/emerge_skia/transport/native.ex
+--- a/lib/emerge_skia/transport/native.ex	2026-10-19 14:06:21.757380725 +0000
++++ b/lib/emerge_skia/transport/native.ex	2026-10-19 14:13:03.195835528 +0000
+@@ -91,7 +91,7 @@
+   @impl true
+   def configure_assets(renderer, asset_config) do
+     Native.configure_assets_nif(native_renderer(renderer), %{
+-      sources: [asset_config.priv_dir],
++      sources: Assets.sources(asset_config),
+       runtime_enabled: asset_config.runtime_enabled,
+       allowlist: asset_config.runtime_allowlist,
+       follow_symlinks: asset_config.runtime_follow_symlinks,
+@@ -210,7 +210,7 @@
+       width: raster_opts.width,
+       height: raster_opts.height,
+       scale: raster_opts.scale,
+-      sources: [asset_config.priv_dir],
++      sources: Assets.sources(asset_config),
+       runtime_enabled: asset_config.runtime_enabled,
+       allowlist: asset_config.runtime_allowlist,
+       follow_symlinks: asset_config.runtime_follow_symlinks,
+@@ -227,7 +227,7 @@
+         Enum.map(asset_config.fonts, fn font ->
+           %{
+             family: font.family,
+-            path: Path.join(asset_config.priv_dir, font.source),
++            path: Assets.source_path(asset_config, font.source),
+             weight: font.weight,
+             italic: font.italic
+           }
+diff -ruN a/lib/emerge_skia.ex b/lib/emerge_skia.ex
+--- a/lib/emerge_skia.ex	2026-10-19 14:06:21.756380730 +0000
++++ b/lib/emerge_skia.ex	2026-10-19 14:13:03.195835528 +0000
+@@ -479,6 +479,27 @@
+   end
+ 
+   @doc """
++  Upload a full tree already encoded with `Emerge.Engine.encode_full/2`, run layout, and render.
++
++  For trees diffed in another process or on another node: the encoder keeps the
++  `Emerge.Engine.diff_state()` (ids and event registry), the renderer only receives
++  bytes. Element events from the renderer carry the encoder's element ids.
++  """
++  @spec upload_tree_binary(renderer(), binary()) :: :ok | {:error, term()}
++  def upload_tree_binary(renderer, full_bin) when is_binary(full_bin) do
++    Transport.for_renderer(renderer).upload_tree(renderer, full_bin)
++  end
++
++  @doc """
++  Apply a patch binary from `Emerge.Engine.diff_state_update/2` to a tree uploaded with
++  `upload_tree_binary/2`, run layout, and render.
++  """
++  @spec patch_tree_binary(renderer(), binary()) :: :ok | {:error, term()}
++  def patch_tree_binary(renderer, patch_bin) when is_binary(patch_bin) do
++    Transport.for_renderer(renderer).patch_tree(renderer, patch_bin)
++  end
++
++  @doc """
+   Measure text dimensions for layout purposes.
+ 
+   Returns `{width, line_height, ascent, descent}` where:

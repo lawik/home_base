@@ -629,7 +629,7 @@ Parallelizable: M3 doesn't depend on M2; M4 doesn't depend on M2–M3.
 
 -  Tailscale on Nerves: which tailscaled build/package is used, how its state dir is persisted across firmware updates, and how auth keys are provisioned per device.
 
--  emerge: what is the current serialization format for the render tree, and does it already have diffing? Decide before M4.
+-  emerge: what is the current serialization format for the render tree, and does it already have diffing? Decide before M4. Answered in docs/EMERGE-FORWARDING.md: a binary format with Elixir-side diffing; forward the encoded bytes.
 
 -  Confirm the device_id each device sends via homex/MQTT discovery identifiers is the one HA's device registry exposes, so the self-lookup in §3.3 matches.
 

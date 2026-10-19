@@ -33,6 +33,9 @@ defmodule HomeBase.MixProject do
       {:membrane_opus_plugin, "~> 0.20"},
       {:membrane_udp_plugin, "~> 0.14"},
       {:membrane_raw_audio_format, "~> 0.12"},
+      # emerge 0.5.0 plus the scene-forwarding hooks in docs/EMERGE-FORWARDING.md.
+      {:emerge, path: System.get_env("EMERGE_PATH", "/root/workspace/emerge-home")},
+      {:solve, "~> 0.3.1"},
       {:bandit, "~> 1.5", only: :test},
       {:websock_adapter, "~> 0.5", only: :test}
     ]
