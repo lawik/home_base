@@ -20,6 +20,24 @@ defmodule Home.Media do
 
   @default_ports 50_000..50_099
 
+  @doc """
+  The H.264 decoder video sinks on this node use: `:software` (FFmpeg, then RGB), or a
+  Membrane filter from `config :home_base, video: [decoder: module | {module, opts}]`.
+
+  The filter takes Annex B access units (`%Membrane.H264{alignment: :au, stream_structure:
+  :annexb}`) and puts out `%VideoInterop.Frame{}` buffers (`VideoInterop.Format`) or raw
+  RGB/RGBA (`Membrane.RawVideo`); either goes to the display as it is. On a Fairphone 3,
+  `Membrane.V4L2.H264.Decoder` decodes with the Venus hardware into DMA-BUF frames that
+  the renderer draws without a copy.
+  """
+  def video_decoder do
+    case Keyword.get(Home.config(:video, []), :decoder, :software) do
+      :software -> :software
+      {module, opts} -> struct!(module, opts)
+      module when is_atom(module) -> module
+    end
+  end
+
   @doc "This node's media address and UDP port range."
   def address do
     media = Home.config(:media, [])

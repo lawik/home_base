@@ -47,6 +47,7 @@ config :home_base,
 | `:cluster` | `[backend: module \| {module, opts}, interval: ms]`. How peers are found; re-queried every `interval` (default 30 s) and on every nodedown. Default backend `Home.Cluster.Epmd`. |
 | `:data_dir` | Where secrets, the area and rendered assets persist. Default `<tmp>/home_base-<node>`. |
 | `:media` | `[ip: ip_tuple, ports: first..last]`: the address and UDP range this node receives media on. Default `{127, 0, 0, 1}`, `50000..50099`. |
+| `:video` | `[decoder: :software \| module \| {module, opts}]`: how this node's displays decode H.264. `:software` (default) is FFmpeg then RGB; a module is a Membrane filter from Annex B access units to `%VideoInterop.Frame{}`s (or RGB/RGBA), e.g. `Membrane.V4L2.H264.Decoder` for the Venus hardware decoder on a Fairphone 3. See `Home.Media.video_decoder/0`. |
 | `:ha` | `[area_refresh: ms, timeout: ms, lookup_timeout: ms]`: Home Assistant area lookup every 3 h, 10 s per network step, 3 × `timeout` for a whole lookup. HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`). |
 | `:watchdog_interval` | How often (ms) the lease watchdog expires old leases. Default 1000. |
 | `:activity` | `[ring: n]`: recent events kept per capability and kind. Default 64. |

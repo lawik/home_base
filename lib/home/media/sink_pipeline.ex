@@ -10,6 +10,10 @@ defmodule Home.Media.SinkPipeline do
       ... -> RTP H.264 depayloader (access units, on the RTP marker) -> H.264 parser
         -> H.264 decoder -> to RGB -> endpoint
 
+  The decoder is FFmpeg's, in software, unless the node has another in `config :home_base,
+  video: [decoder: ...]` (see `Home.Media.video_decoder/0`), such as a hardware one; its
+  frames then go to the endpoint as they come out, without the conversion to RGB.
+
   The RTCP receiver's feedback (receiver reports, NACKs, PLIs) goes back out of the same
   UDP endpoint to wherever the RTP comes from (see `Home.Media.RTCP`). After a loss the
   video freezes until a keyframe and a PLI asks for one (`Home.Media.H264Depayloader`);
@@ -62,9 +66,7 @@ defmodule Home.Media.SinkPipeline do
   defp decode(demuxer, %{codec: :h264}) do
     demuxer
     |> child(:depayloader, Home.Media.H264Depayloader)
-    |> child(:parser, Membrane.H264.Parser)
-    |> child(:decoder, Membrane.H264.FFmpeg.Decoder)
-    |> child(:to_rgb, %Membrane.FFmpeg.SWScale.Converter{format: :RGB})
+    |> decode_h264(Home.Media.video_decoder())
   end
 
   defp decode(demuxer, opts) do
@@ -73,6 +75,22 @@ defmodule Home.Media.SinkPipeline do
     |> child(:decoder, Membrane.Opus.Decoder)
     |> child(:level, %Home.Media.Level{cap: opts.cap, kind: opts.kind, session: opts.session})
     |> playout(opts)
+  end
+
+  defp decode_h264(access_units, :software) do
+    access_units
+    |> child(:parser, Membrane.H264.Parser)
+    |> child(:decoder, Membrane.H264.FFmpeg.Decoder)
+    |> child(:to_rgb, %Membrane.FFmpeg.SWScale.Converter{format: :RGB})
+  end
+
+  defp decode_h264(access_units, decoder) do
+    access_units
+    |> child(:parser, %Membrane.H264.Parser{
+      output_alignment: :au,
+      output_stream_structure: :annexb
+    })
+    |> child(:decoder, decoder)
   end
 
   defp playout(audio, %{playout: false}), do: audio

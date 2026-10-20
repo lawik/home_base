@@ -314,8 +314,14 @@ defmodule Home.Render.Compositor do
     end
   end
 
-  # Frames of a hidden session, or before the tree with the element is up, are dropped.
+  # Frames of a hidden session, or before the tree with the element is up, are dropped,
+  # and so is every frame a newer one for the same element has overtaken in the mailbox:
+  # a renderer that falls behind shows the latest picture instead of queueing them
+  # (decoded frames are large; a hardware decoder's are buffers it wants back). A dropped
+  # frame is released.
   def handle_info({:video_frame, pid, target, frame}, state) do
+    frame = latest_frame(pid, target, frame)
+
     drawn? =
       case state.composed do
         nil -> top(state) == pid and state.synced?
@@ -328,6 +334,7 @@ defmodule Home.Render.Compositor do
         error -> {:noreply, log_error(state, :video_frame, error)}
       end
     else
+      VideoInterop.release(frame)
       {:noreply, state}
     end
   end
@@ -364,6 +371,16 @@ defmodule Home.Render.Compositor do
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state), do: {:noreply, drop(state, pid)}
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp latest_frame(pid, target, frame) do
+    receive do
+      {:video_frame, ^pid, ^target, newer} ->
+        VideoInterop.release(frame)
+        latest_frame(pid, target, newer)
+    after
+      0 -> frame
+    end
+  end
 
   @impl true
   def terminate(_reason, state) do
