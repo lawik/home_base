@@ -1,6 +1,7 @@
 defmodule Home.Capability do
   @moduledoc """
-  One piece of hardware a node vends: a mic, a speaker, a display, a radio, a sensor.
+  One piece of hardware a node vends: a mic, a speaker, a display, a radio, a sensor, a
+  light (`Home.Light`).
 
   `availability`:
 
@@ -33,7 +34,8 @@ defmodule Home.Capability do
     :zigbee,
     :thread,
     :sensor,
-    :presence
+    :presence,
+    :light
   ]
 
   @enforce_keys [:id, :kind]
@@ -58,6 +60,7 @@ defmodule Home.Capability do
           | :thread
           | :sensor
           | :presence
+          | :light
   @type ref :: {node(), id()}
   @type t :: %__MODULE__{
           id: id(),

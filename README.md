@@ -67,7 +67,7 @@ The node itself must already be distributed (`--name`/`-name`, shared cookie);
 | Field | Meaning |
 | --- | --- |
 | `id` | Unique on the node, e.g. `"mic0"`. Cluster-wide a capability is `{node, id}`. |
-| `kind` | `:audio_in`, `:audio_out`, `:video_in`, `:display`, `:input`, `:zigbee`, `:thread`, `:sensor`, `:presence`. |
+| `kind` | `:audio_in`, `:audio_out`, `:video_in`, `:display`, `:input`, `:zigbee`, `:thread`, `:sensor`, `:presence`, `:light`. |
 | `availability` | `:always` (default; hardware on at boot), `:on_request` (on only while leased), `:off` (not vended). |
 | `adapter` | `module` or `{module, opts}` implementing `Home.Adapter`; opts are merged into `meta`. |
 | `max_age` | Lease safety timeout in ms, counted from the last renew. Default 10 min for `:audio_in`/`:video_in`, 60 min otherwise. |
@@ -77,7 +77,9 @@ Adapters: `Home.Adapters.Audio.PortAudioIn` / `PortAudioOut` (real sound cards),
 `Home.Adapters.Video.Camera` (V4L2/AVFoundation), `Home.Adapters.Display` (emerge:
 window, DRM or headless), the synthetic `Home.Adapters.Audio.SynthMic`,
 `Home.Adapters.Audio.CaptureSpeaker` and `Home.Adapters.Video.SynthCamera` (for tests and
-demos), and `Home.Adapters.Null` (announce only).
+demos), `Home.Adapters.Light` (LEDs behind a `Home.Light.Driver`: an addressable strip
+or a plain on/off or dimmable light; see `Home.Light`), and `Home.Adapters.Null`
+(announce only).
 
 `:audio_out` and `:display` leases are shared (the speaker mixes, the display draws the
 newest session on top); the other kinds take one lease at a time.
