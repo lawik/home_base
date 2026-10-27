@@ -237,7 +237,17 @@ defmodule Home.Render.Video do
   defp start_media(state, source, display, opts) do
     media_opts =
       opts
-      |> Keyword.take([:bitrate, :gop_size, :jitter, :renew_every, :feedback, :route])
+      |> Keyword.take([
+        :bitrate,
+        :gop_size,
+        :jitter,
+        :renew_every,
+        :feedback,
+        :route,
+        :size,
+        :fps,
+        :decoder
+      ])
       |> Keyword.merge(
         source: source,
         sink: display,

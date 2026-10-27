@@ -43,4 +43,27 @@ defmodule Home.Onvif.Camera do
   @impl true
   def endpoint(%{relay: nil}), do: nil
   def endpoint(%{relay: relay}), do: %Home.Media.H264Relay{feed: relay}
+
+  # The camera's own encoder, one stream as its ONVIF profile has it. ONVIF doesn't say
+  # which H.264 profile, so any decoder is taken to manage it. Its bitrate limit is in
+  # kbit/s.
+  @impl true
+  def video(%{cap: %{meta: meta}}) do
+    size = if meta[:w] && meta[:h], do: {meta.w, meta.h}
+    bitrate = if is_integer(meta[:bitrate]), do: meta.bitrate * 1_000
+
+    [
+      %Home.Media.Video.Format{
+        hardware: true,
+        element: :relay,
+        name: Enum.join(Enum.reject([meta[:manufacturer], meta[:model]], &is_nil/1), " "),
+        size: size,
+        sizes: size && [size],
+        fps: meta[:fps],
+        max_fps: meta[:fps],
+        bitrate: bitrate,
+        max_bitrate: bitrate
+      }
+    ]
+  end
 end

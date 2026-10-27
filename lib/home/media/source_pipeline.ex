@@ -18,6 +18,10 @@ defmodule Home.Media.SourcePipeline do
   A camera can't be asked for a keyframe, so PLIs are ignored for that source; the relay
   starts every subscriber at a keyframe instead.
 
+  Video sends the stream the session negotiated (`:video`, a `Home.Media.Video.Path`,
+  see `Home.Media.Video`): x264 encodes its profile, scaled down to its size; a relay
+  gets its size, frame rate and bitrate as `params` to start its stream with.
+
   One encoder and one payloader however many sinks (§5.3). Each destination gets a UDP
   endpoint on an ephemeral port of this node's media address; the sink's RTCP (receiver
   reports, NACKs, PLIs) comes back on it (see `Home.Media.RTCP`). A PLI from any sink
@@ -37,6 +41,7 @@ defmodule Home.Media.SourcePipeline do
   def handle_init(_ctx, opts) do
     Process.monitor(opts.session)
     {local_ip, _ports} = Home.Media.address()
+    opts = Map.update!(opts, :endpoint, &relay_params(&1, Map.get(opts, :video)))
 
     spec =
       [
@@ -59,7 +64,7 @@ defmodule Home.Media.SourcePipeline do
   defp destination({ip, port} = dest, local_ip) do
     get_child(:tee)
     |> via_out(:push_output)
-    |> child({:udp, dest}, %Membrane.UDP.Endpoint{
+    |> child({:udp, dest}, %Home.Media.UDPEndpoint{
       destination_address: ip,
       destination_port_no: port,
       local_address: local_ip
@@ -71,6 +76,24 @@ defmodule Home.Media.SourcePipeline do
   defp clock_rate(%{codec: :h264}), do: 90_000
   defp clock_rate(_opts), do: 48_000
 
+  # Map.put rather than a struct update: the endpoint may come from a node whose
+  # H264Relay has no `params` yet.
+  defp relay_params(%Home.Media.H264Relay{} = relay, %Home.Media.Video.Path{} = path) do
+    {width, height} = path.size || {nil, nil}
+
+    params = %{
+      profile: path.profile,
+      width: width,
+      height: height,
+      framerate: path.fps,
+      bitrate: path.bitrate
+    }
+
+    Map.put(relay, :params, params)
+  end
+
+  defp relay_params(endpoint, _path), do: endpoint
+
   defp encode(endpoint, %{codec: :h264, endpoint: %Home.Media.H264Relay{}}) do
     endpoint
     |> child(:parser, %Membrane.H264.Parser{output_alignment: :au, repeat_parameter_sets: true})
@@ -78,14 +101,20 @@ defmodule Home.Media.SourcePipeline do
   end
 
   defp encode(endpoint, %{codec: :h264} = opts) do
+    {width, height} = scaled_size(Map.get(opts, :video))
+
     # x264 in CRF mode capped at `bitrate` (VBV), tuned for latency: no B-frames, a
     # keyframe every `gop_size` frames and whenever a sink asks for one.
     endpoint
-    |> child(:to_i420, %Membrane.FFmpeg.SWScale.Converter{format: :I420})
+    |> child(:to_i420, %Membrane.FFmpeg.SWScale.Converter{
+      format: :I420,
+      output_width: width,
+      output_height: height
+    })
     |> child(:encoder, %Membrane.H264.FFmpeg.Encoder{
       preset: :ultrafast,
       tune: :zerolatency,
-      profile: :baseline,
+      profile: x264_profile(Map.get(opts, :video)),
       max_b_frames: 0,
       gop_size: opts.gop_size,
       ffmpeg_params: %{
@@ -107,6 +136,20 @@ defmodule Home.Media.SourcePipeline do
     })
     |> child(:payloader, Membrane.RTP.Opus.Payloader)
   end
+
+  # Scaled only when the negotiated size isn't the camera's own.
+  defp scaled_size(%Home.Media.Video.Path{size: size, encoder: %{size: own}})
+       when size != nil and size != own,
+       do: size
+
+  defp scaled_size(_path), do: {nil, nil}
+
+  # x264's baseline is constrained baseline; it has no profile by that name.
+  defp x264_profile(%Home.Media.Video.Path{profile: profile})
+       when profile in [:main, :high],
+       do: profile
+
+  defp x264_profile(_path), do: :baseline
 
   @impl true
   def handle_setup(ctx, state) do

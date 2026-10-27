@@ -22,7 +22,9 @@ defmodule Home.Capability.Server do
   @doc """
   The capability as `Home.Registry.list/1` returns it: `%{ref, cap, pid, device_id, area,
   status (:idle | :leased), hardware (:on | :off), leases (count), held_by: [%{ref,
-  holder, purpose}]}`.
+  holder, purpose}], video}`. `video` is what a `:video_in` encodes (`%{encode: formats}`)
+  or a `:display` decodes (`%{decode: formats}`), see `Home.Media.Video`; nil for other
+  kinds.
   """
   def info(pid, timeout \\ 5_000), do: GenServer.call(pid, :info, timeout)
 
@@ -254,7 +256,8 @@ defmodule Home.Capability.Server do
       held_by:
         for {ref, %{lease: lease}} <- state.leases do
           %{ref: ref, holder: lease.holder, purpose: lease.purpose}
-        end
+        end,
+      video: Home.Media.Video.support(state.cap, state.adapter, state.astate)
     }
   end
 

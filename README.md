@@ -47,6 +47,7 @@ config :home_base,
 | `:cluster` | `[backend: module \| {module, opts}, interval: ms]`. How peers are found; re-queried every `interval` (default 30 s) and on every nodedown. Default backend `Home.Cluster.Epmd`. |
 | `:data_dir` | Where secrets, the area and rendered assets persist. Default `<tmp>/home_base-<node>`. |
 | `:media` | `[ip: ip_tuple, ports: first..last]`: the address and UDP range this node receives media on. Default `{127, 0, 0, 1}`, `50000..50099`. |
+| `:video` | `[decoders: [...], software: true]`: what this node's displays decode H.264 with. `decoders` are its hardware decoders, each a `Home.Media.Video.Format` or its fields: `element` (a Membrane filter from Annex B access units to `%VideoInterop.Frame{}`s or RGB/RGBA, e.g. `Membrane.V4L2.H264.Decoder` for the Venus hardware decoder on a Fairphone 3), `name`, `profiles`, `max_level`, `max_size`, `max_fps`. FFmpeg's software decoder comes after them unless `software: false`. Video sessions negotiate a stream these take, in hardware where there is any (see `Home.Media.Video`). The older `decoder: module` is one hardware decoder with no known limits. |
 | `:ha` | `[area_refresh: ms, timeout: ms, lookup_timeout: ms]`: Home Assistant area lookup every 3 h, 10 s per network step, 3 × `timeout` for a whole lookup. HA URL and token come from `Home.Secrets` (`:ha_url`, `:ha_token`). |
 | `:watchdog_interval` | How often (ms) the lease watchdog expires old leases. Default 1000. |
 | `:activity` | `[ring: n]`: recent events kept per capability and kind. Default 64. |

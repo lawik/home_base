@@ -10,6 +10,13 @@ defmodule Home.Media.SinkPipeline do
       ... -> RTP H.264 depayloader (access units, on the RTP marker) -> H.264 parser
         -> H.264 decoder -> to RGB -> endpoint
 
+  The decoder is the one the session's negotiation chose for this sink (`:video_decoder`,
+  a `Home.Media.Video.Format` of this node's, see `Home.Media.Video`): FFmpeg's, in
+  software, or a filter such as a hardware decoder, whose frames go to the endpoint as
+  they come out, without the conversion to RGB. A session from a node without
+  negotiation gives none, and this node's default decoder (`Home.Media.video_decoder/0`)
+  is used.
+
   The RTCP receiver's feedback (receiver reports, NACKs, PLIs) goes back out of the same
   UDP endpoint to wherever the RTP comes from (see `Home.Media.RTCP`). After a loss the
   video freezes until a keyframe and a PLI asks for one (`Home.Media.H264Depayloader`);
@@ -32,7 +39,7 @@ defmodule Home.Media.SinkPipeline do
     spec = [
       # The destination is only a placeholder: feedback goes back to the RTP's sender
       # (`latch?`), and nothing is sent before the first RTP packet.
-      child(:udp, %Membrane.UDP.Endpoint{
+      child(:udp, %Home.Media.UDPEndpoint{
         local_port_no: opts.port,
         local_address: opts.ip,
         destination_address: opts.ip,
@@ -59,12 +66,16 @@ defmodule Home.Media.SinkPipeline do
     {[spec: spec], Map.merge(opts, %{rtp: %{}, playout_stats: nil})}
   end
 
-  defp decode(demuxer, %{codec: :h264}) do
+  defp decode(demuxer, %{codec: :h264} = opts) do
+    decoder =
+      case Map.get(opts, :video_decoder) do
+        %Home.Media.Video.Format{element: element} -> Home.Media.decoder_element(element)
+        nil -> Home.Media.video_decoder()
+      end
+
     demuxer
     |> child(:depayloader, Home.Media.H264Depayloader)
-    |> child(:parser, Membrane.H264.Parser)
-    |> child(:decoder, Membrane.H264.FFmpeg.Decoder)
-    |> child(:to_rgb, %Membrane.FFmpeg.SWScale.Converter{format: :RGB})
+    |> decode_h264(decoder)
   end
 
   defp decode(demuxer, opts) do
@@ -73,6 +84,22 @@ defmodule Home.Media.SinkPipeline do
     |> child(:decoder, Membrane.Opus.Decoder)
     |> child(:level, %Home.Media.Level{cap: opts.cap, kind: opts.kind, session: opts.session})
     |> playout(opts)
+  end
+
+  defp decode_h264(access_units, :software) do
+    access_units
+    |> child(:parser, Membrane.H264.Parser)
+    |> child(:decoder, Membrane.H264.FFmpeg.Decoder)
+    |> child(:to_rgb, %Membrane.FFmpeg.SWScale.Converter{format: :RGB})
+  end
+
+  defp decode_h264(access_units, decoder) do
+    access_units
+    |> child(:parser, %Membrane.H264.Parser{
+      output_alignment: :au,
+      output_stream_structure: :annexb
+    })
+    |> child(:decoder, decoder)
   end
 
   defp playout(audio, %{playout: false}), do: audio
