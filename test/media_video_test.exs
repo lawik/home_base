@@ -117,6 +117,40 @@ defmodule Home.MediaVideoTest do
       assert {:ok, %{fps: 30}} = Video.negotiate([@phone_camera], [display([@venus])], fps: 60)
     end
 
+    test "a sink that wants a small, thin stream gets one, made so at the source" do
+      camera = %{@phone_camera | sizes: [{1280, 720}, {640, 360}, {384, 216}]}
+
+      watch = %Format{
+        hardware: true,
+        element: :software,
+        name: "watch",
+        max_size: {400, 400},
+        max_bitrate: 250_000
+      }
+
+      assert {:ok, path} = Video.negotiate([camera], [display([watch])])
+      assert path.size == {384, 216}
+      assert path.bitrate == 250_000
+
+      # x264 scales to it.
+      assert {:ok, %{size: {400, 224}, bitrate: 250_000}} =
+               Video.negotiate([x264(1280, 720)], [display([watch])])
+
+      # With a phone on the same stream, the watch sets it for both.
+      sinks = [display([@venus], :auto, {:b, "phone"}), display([watch], :auto, {:c, "watch"})]
+      assert {:ok, %{size: {384, 216}, bitrate: 250_000}} = Video.negotiate([camera], sinks)
+
+      # A stream already running at 1 Mbit/s is too much for it.
+      {:ok, running} = Video.negotiate([camera], [display([@venus])], size: {384, 216})
+
+      assert {:error, {:no_video_path, [%{reason: {:bitrate, 1_000_000, 250_000}} = failure]}} =
+               Video.accepts([watch], running)
+
+      assert Video.explain([failure]) == [
+               "watch: takes up to 250 kbit/s, the stream is 1.0 Mbit/s"
+             ]
+    end
+
     test "x264 scales down to fit, keeping the picture's shape" do
       assert {:ok, path} = Video.negotiate([x264(1920, 1080)], [display([@small_hw])])
       assert path.size == {640, 360}

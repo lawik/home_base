@@ -229,12 +229,13 @@ defmodule Home.Media.Video do
 
   @doc """
   Whether a sink with `decoders` can join a stream already settled as `path`, decoding
-  as `preference` says: `{:ok, decoder}`, or `{:error, {:no_video_path, reasons}}`.
+  as `preference` says: `{:ok, decoder}`, or `{:error, {:no_video_path, reasons}}`. The
+  stream's bitrate is set by then, so a decoder that wants less (`max_bitrate`) can't.
   """
   @spec accepts([Format.t() | map()], Path.t(), preference(), Home.Capability.ref() | nil) ::
           {:ok, Format.t()} | {:error, {:no_video_path, [failure()]}}
   def accepts(decoders, %Path{} = path, preference \\ :auto, ref \\ nil) do
-    stream = Map.take(path, [:codec, :profile, :size, :fps, :level])
+    stream = Map.take(path, [:codec, :profile, :size, :fps, :level, :bitrate])
 
     case candidates(decoders, preference, path.codec) do
       [] ->
@@ -305,7 +306,8 @@ defmodule Home.Media.Video do
           size: size,
           fps: fps,
           level: stream.level,
-          bitrate: bitrate,
+          # No more than any sink wants to receive.
+          bitrate: min_of([bitrate | Enum.map(Map.values(decoders), & &1.max_bitrate)]),
           encoder: encoder,
           decoders: decoders
         }
@@ -339,7 +341,9 @@ defmodule Home.Media.Video do
   end
 
   @doc false
-  # Whether `decoder` takes `stream` (`%{codec, profile, size, fps, level}`).
+  # Whether `decoder` takes `stream` (`%{codec, profile, size, fps, level}`, and the
+  # `bitrate` of one already running; a stream being settled is capped to the decoder's
+  # instead).
   def takes(%Format{} = decoder, stream) do
     cond do
       decoder.codec != stream.codec ->
@@ -356,6 +360,9 @@ defmodule Home.Media.Video do
 
       not at_most?(stream.level, decoder.max_level) ->
         {:error, {:level, stream.level, decoder.max_level}}
+
+      not at_most?(stream[:bitrate], decoder.max_bitrate) ->
+        {:error, {:bitrate, stream.bitrate, decoder.max_bitrate}}
 
       true ->
         :ok
@@ -525,7 +532,7 @@ defmodule Home.Media.Video do
         path.size && size_name(path.size),
         path.fps && "#{path.fps} fps",
         path.level && "level #{level_name(path.level)}",
-        path.bitrate && "#{Float.round(path.bitrate / 1_000_000, 1)} Mbit/s"
+        path.bitrate && rate_name(path.bitrate)
       ]
       |> Enum.reject(&is_nil/1)
       |> Enum.join(" ")
@@ -541,7 +548,8 @@ defmodule Home.Media.Video do
         format.sizes && Enum.map_join(format.sizes, ", ", &size_name/1),
         format.max_size && "up to #{size_name(format.max_size)}",
         format.max_fps && "#{format.max_fps} fps",
-        format.max_level && "level #{level_name(format.max_level)}"
+        format.max_level && "level #{level_name(format.max_level)}",
+        format.max_bitrate && "up to #{rate_name(format.max_bitrate)}"
       ]
       |> Enum.reject(&is_nil/1)
       |> Enum.join(", ")
@@ -574,6 +582,9 @@ defmodule Home.Media.Video do
 
   defp reason({:fps, fps, max}), do: "takes up to #{max} fps, the stream is #{fps}"
 
+  defp reason({:bitrate, bitrate, max}),
+    do: "takes up to #{rate_name(max)}, the stream is #{rate_name(bitrate)}"
+
   defp reason({:level, level, max}),
     do: "goes up to level #{level_name(max)}, the stream needs #{level_name(level)}"
 
@@ -593,4 +604,7 @@ defmodule Home.Media.Video do
 
   defp size_name({w, h}), do: "#{w}×#{h}"
   defp level_name(level), do: "#{div(level, 10)}.#{rem(level, 10)}"
+
+  defp rate_name(bps) when bps < 1_000_000, do: "#{div(bps, 1_000)} kbit/s"
+  defp rate_name(bps), do: "#{Float.round(bps / 1_000_000, 1)} Mbit/s"
 end

@@ -88,8 +88,12 @@ both ends manage before it starts anything.
   that scales tries the decoders' limits and a ladder of smaller sizes; one with a list
   of `sizes` tries those), and takes the first stream every sink has a decoder for:
   profile accepted, size within `max_size`, frame rate within `max_fps`, and the level the
-  size and rate need (Table A-1) within `max_level`. The result is a
-  `Home.Media.Video.Path`: the stream, the encoder, and each sink's decoder.
+  size and rate need (Table A-1) within `max_level`. The bitrate is the one asked for (or
+  the encoder's default), capped by the encoder's `max_bitrate` and every chosen
+  decoder's: a decoder that wants a small, thin stream (a watch: `max_size: {400, 400},
+  max_bitrate: 250_000`) has it made that way at the source, for every sink of the
+  session, since there is one stream. The result is a `Home.Media.Video.Path`: the
+  stream, the encoder, and each sink's decoder.
 * **Hardware first, failure otherwise**: by default (`decoder: :auto`) a sink whose node
   has hardware decoders only uses those. A stream they can't take is
   `{:error, {:no_video_path, reasons}}` (`explain/1` gives them in words), never a

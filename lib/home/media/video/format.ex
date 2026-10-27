@@ -15,9 +15,14 @@ defmodule Home.Media.Video.Format do
       (a decoder): `:constrained_baseline`, `:baseline`, `:main`, `:high`. `nil` if
       unknown, which matches anything.
     * `:max_level` - highest H.264 level, as `level_idc` (31 for 3.1, 51 for 5.1).
-    * `:max_size` - largest `{width, height}`.
+    * `:max_size` - largest `{width, height}`. For a decoder that wants small pictures
+      (a watch), this is what has them made small at the source: the stream is no
+      larger.
     * `:sizes` - an encoder that only makes certain sizes: the list of them.
-    * `:max_fps`, `:max_bitrate` (bits per second).
+    * `:max_fps`.
+    * `:max_bitrate` (bits per second) - what an encoder can send, or the most a decoder
+      wants to receive: a stream is settled at no more than any of its sinks' (a sink
+      joining a running stream above it is refused).
     * `:size`, `:fps`, `:bitrate` - an encoder's defaults, used unless a session asks for
       something else.
 
