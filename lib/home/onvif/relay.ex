@@ -84,6 +84,10 @@ defmodule Home.Onvif.Relay do
   def handle_continue(:connect, state), do: {:noreply, connect(state)}
 
   @impl true
+  # The camera's stream is what it is: a session's negotiated parameters change nothing.
+  def handle_call({:subscribe, pid, _params}, from, state),
+    do: handle_call({:subscribe, pid}, from, state)
+
   def handle_call({:subscribe, pid}, _from, state) do
     mref = Process.monitor(pid)
 

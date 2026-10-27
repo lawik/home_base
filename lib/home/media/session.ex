@@ -30,6 +30,12 @@ defmodule Home.Media.Session do
   `Home.Render.show_video/2`). The source can also be a Membrane source element to run
   on this node instead of a lease, e.g. a `Home.Media.FrameSource` for pixel forwarding.
 
+  Before a video session starts anything it negotiates its stream (`Home.Media.Video`):
+  a profile, size, frame rate and bitrate the source can make and every sink can decode,
+  in hardware where the sink has it. If there is none, `start/1` returns `{:error,
+  {:no_video_path, reasons}}`; a sink added later that can't take the stream gets the
+  same from `add_sink/3`. `info/1` has the stream (`video:`).
+
   Options:
 
     * `:source` - lease on an `:audio_in` (`:video_in`) capability, or a Membrane
@@ -41,7 +47,14 @@ defmodule Home.Media.Session do
     * `:renew_every` - ms between lease renewals, default 30 s.
     * `:jitter` - receiver jitter buffer in ms, default 40: how long a sink waits for a
       missing (NACKed) packet before giving up on it.
-    * `:bitrate` - encoder bitrate, default 64 kbps (Opus) or 3 Mbps (H.264, a cap).
+    * `:bitrate` - encoder bitrate, default 64 kbps (Opus) or 3 Mbps (H.264, a cap; up
+      to what the source can send).
+    * `:size`, `:fps` - video: the size (`{w, h}`) and frame rate wanted, where the
+      source can change them (default: the source's own). Negotiation goes smaller when
+      a sink can't take them.
+    * `:decoder` - video: what the sinks decode with: `:auto` (default; their node's
+      hardware decoders if it has any, else software), `:software` (the override, even
+      where there is hardware) or `:hardware`.
     * `:feedback` - which RTCP feedback sinks send: a subset of `[:nack, :pli]` (default
       both). Receiver reports are always sent.
     * `:playout` - audio sinks: playout queue to keep, in ms (default 20; see
@@ -98,10 +111,14 @@ defmodule Home.Media.Session do
   Add a sink to a running session. The session becomes the holder of `lease` (an
   `:audio_out` or `:display` lease, like the ones given to `start/1`) and the source
   starts sending to it; a video sink gets a fresh keyframe.
+
+  A video sink must take the stream the session sends (`{:error, {:no_video_path,
+  reasons}}` otherwise; the lease stays the caller's). `opts`: `:decoder`, as for
+  `start/1`, for this sink (default: the session's).
   """
-  @spec add_sink(pid(), Lease.t()) :: :ok | {:error, term()}
-  def add_sink(session, %Lease{} = lease),
-    do: GenServer.call(session, {:add_sink, lease}, @call_timeout * 2)
+  @spec add_sink(pid(), Lease.t(), keyword()) :: :ok | {:error, term()}
+  def add_sink(session, %Lease{} = lease, opts \\ []),
+    do: GenServer.call(session, {:add_sink, lease, opts}, @call_timeout * 2)
 
   @doc """
   Remove a sink (by capability ref or lease) from a running session: the source stops
@@ -152,6 +169,8 @@ defmodule Home.Media.Session do
           source_pipeline: nil,
           # One per sink, in the order they were added.
           outputs: [],
+          # Video: the negotiated stream (a Home.Media.Video.Path).
+          video: nil,
           opts: opts
         }
 
@@ -168,6 +187,7 @@ defmodule Home.Media.Session do
     {reply_to, ref} = state.opts[:reply_to]
 
     with {:ok, state} <- take_source(state),
+         {:ok, state} <- negotiate_video(state),
          {:ok, state} <- add_outputs(state, state.sinks),
          {:ok, state} <- start_source(state) do
       Process.send_after(self(), :renew, renew_every(state))
@@ -187,27 +207,27 @@ defmodule Home.Media.Session do
       sinks: Enum.map(state.outputs, & &1.cap),
       destinations: Enum.map(state.outputs, & &1.address),
       ssrc: state.ssrc,
-      pipelines: pipelines(state)
+      pipelines: pipelines(state),
+      video: state.video
     }
 
     {:reply, reply, state}
   end
 
-  def handle_call({:add_sink, lease}, _from, state) do
+  def handle_call({:add_sink, lease, opts}, _from, state) do
     if Enum.any?(state.outputs, &(&1.cap == lease.cap)) do
       {:reply, {:error, :already_a_sink}, state}
     else
-      case add_output(state, lease) do
-        {:ok, state} ->
-          output = List.last(state.outputs)
+      with {:ok, state} <- accept_sink(state, lease, opts),
+           {:ok, state} <- add_output(state, lease) do
+        output = List.last(state.outputs)
 
-          case source_call(state, {:add_destination, output.to}) do
-            :ok -> {:reply, :ok, state}
-            error -> {:reply, error, drop_output(state, output)}
-          end
-
-        {:error, reason, state} ->
-          {:reply, {:error, reason}, state}
+        case source_call(state, {:add_destination, output.to}) do
+          :ok -> {:reply, :ok, state}
+          error -> {:reply, error, drop_output(state, output)}
+        end
+      else
+        {:error, reason, state} -> {:reply, {:error, reason}, state}
       end
     end
   end
@@ -297,6 +317,53 @@ defmodule Home.Media.Session do
 
   defp take_source(state), do: {:ok, state}
 
+  # Video: settle the stream before anything starts, from what the source and the sinks
+  # say they can do (`Home.Media.Video`).
+  defp negotiate_video(%{opts: opts} = state) do
+    if Keyword.get(opts, :codec) == :h264 do
+      preference = Keyword.get(opts, :decoder, :auto)
+      sinks = for lease <- state.sinks, do: {lease.cap, decode_formats(lease), preference}
+      request = Keyword.take(opts, [:size, :fps, :bitrate])
+
+      case Home.Media.Video.negotiate(source_formats(state), sinks, request) do
+        {:ok, path} ->
+          Logger.debug("video session: #{Home.Media.Video.describe(path)}")
+          {:ok, %{state | video: path}}
+
+        {:error, reason} ->
+          {:error, reason, state}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  # A sink joining a running video session takes the stream as it is.
+  defp accept_sink(%{video: nil} = state, _lease, _opts), do: {:ok, state}
+
+  defp accept_sink(%{video: path} = state, lease, opts) do
+    preference = Keyword.get(opts, :decoder) || Keyword.get(state.opts, :decoder, :auto)
+
+    case Home.Media.Video.accepts(decode_formats(lease), path, preference, lease.cap) do
+      {:ok, decoder} -> {:ok, put_in(state.video.decoders[lease.cap], decoder)}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp source_formats(%{source: %Lease{} = lease}),
+    do: lease |> lease_info() |> Home.Media.Video.formats(:encode)
+
+  # A source element on this node sends raw frames, for x264.
+  defp source_formats(_state), do: [Home.Media.Video.software_encoder()]
+
+  defp decode_formats(lease), do: lease |> lease_info() |> Home.Media.Video.formats(:decode)
+
+  defp lease_info(lease) do
+    Home.Capability.Server.info(lease.server)
+  catch
+    :exit, _ -> %{}
+  end
+
   defp take(state, lease) do
     case Lease.handover(lease, self()) do
       {:ok, lease} ->
@@ -328,7 +395,8 @@ defmodule Home.Media.Session do
           ssrc: state.ssrc,
           session: self(),
           cap: lease.cap,
-          jitter: Keyword.get(state.opts, :jitter, 40)
+          jitter: Keyword.get(state.opts, :jitter, 40),
+          video_decoder: state.video && state.video.decoders[lease.cap]
         })
 
       case remote(lease, :start_sink, [lease.endpoint, opts]) do
@@ -371,7 +439,9 @@ defmodule Home.Media.Session do
       state
       | outputs: List.delete(state.outputs, output),
         taken: Enum.reject(state.taken, &(&1.ref == output.lease.ref)),
-        monitors: Map.drop(state.monitors, output.mrefs)
+        monitors: Map.drop(state.monitors, output.mrefs),
+        video:
+          state.video && %{state.video | decoders: Map.delete(state.video.decoders, output.cap)}
     }
   end
 
@@ -416,9 +486,12 @@ defmodule Home.Media.Session do
   end
 
   defp media_opts(state) do
-    state.opts
-    |> Keyword.take([:codec, :bitrate, :surface, :gop_size, :feedback, :playout])
-    |> Map.new()
+    opts =
+      state.opts
+      |> Keyword.take([:codec, :bitrate, :surface, :gop_size, :feedback, :playout])
+      |> Map.new()
+
+    if state.video, do: Map.put(opts, :video, state.video), else: opts
   end
 
   defp source_ref(%Lease{cap: cap}), do: cap

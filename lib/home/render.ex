@@ -49,8 +49,12 @@ defmodule Home.Render do
   pid; `stop/1` stops it, and it stops by itself when either side goes away.
 
   Options: `:on` (required), `:purpose`, `:bitrate` (H.264 cap, default 3 Mbps),
-  `:gop_size`, `:jitter`, `:feedback`, `:route` (see `Home.Media.Session`), `:input_to` (a
-  pid that gets the display's input events).
+  `:size`, `:fps`, `:decoder` (`:software` to decode in software where the display has
+  hardware), `:gop_size`, `:jitter`, `:feedback`, `:route` (see `Home.Media.Session`),
+  `:input_to` (a pid that gets the display's input events).
+
+  A camera whose stream the display can't decode isn't shown: `{:error, {:media_failed,
+  {:no_video_path, reasons}}}` (see `Home.Media.Video`).
   """
   @spec show_video(Home.Lease.t() | Home.Capability.ref(), keyword()) ::
           {:ok, pid()} | {:error, term()}

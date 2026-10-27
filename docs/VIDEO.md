@@ -69,6 +69,49 @@ emerge can't do is take injected pointer input into a headless renderer (see lim
   video process stops the media session, which terminates the camera's pipeline:
   `Membrane.CameraCapture` closes the device and an `:on_request` camera turns off.
 
+## Negotiation (`Home.Media.Video`)
+
+Cameras and displays say what they can do, and a video session settles one stream that
+both ends manage before it starts anything.
+
+* **Support**: every `:video_in` and `:display` has `video:` in its registry info:
+  `%{encode: [%Home.Media.Video.Format{}]}` or `%{decode: [...]}`. A format is a codec
+  (`:h264`), `hardware`, what runs it (`element`: `:software`, `:relay`, or a decoder
+  filter), `profiles`, `max_level` (`level_idc`), `max_size`, `sizes`, `max_fps`,
+  `max_bitrate`, and an encoder's defaults (`size`, `fps`, `bitrate`). An adapter states
+  its own (`c:Home.Adapter.video/1`: a phone camera encoded by Venus, an ONVIF camera);
+  otherwise a camera is x264's at its meta size and rate, and a display has its node's
+  decoders (`config :home_base, video: [decoders: [...]]`, then FFmpeg).
+  `Home.Media.Video.list/1` shows the cluster's; `describe/1` puts one in a line.
+* **Settling**: `Home.Media.Video.negotiate/3` tries the source's encoders (hardware
+  first), each of its profiles in order, and sizes from the one wanted down (an encoder
+  that scales tries the decoders' limits and a ladder of smaller sizes; one with a list
+  of `sizes` tries those), and takes the first stream every sink has a decoder for:
+  profile accepted, size within `max_size`, frame rate within `max_fps`, and the level the
+  size and rate need (Table A-1) within `max_level`. The result is a
+  `Home.Media.Video.Path`: the stream, the encoder, and each sink's decoder.
+* **Hardware first, failure otherwise**: by default (`decoder: :auto`) a sink whose node
+  has hardware decoders only uses those. A stream they can't take is
+  `{:error, {:no_video_path, reasons}}` (`explain/1` gives them in words), never a
+  silent fall back to slow software. `decoder: :software` is the override, for the
+  device that asks: that sink decodes with FFmpeg, and the source sends the same.
+  `:hardware` refuses software even where it's all a node has.
+* **Doing it**: the source sends the path: x264 gets its profile and is scaled to its
+  size; a `Home.Media.H264Relay` subscribes to its feed with the path's size, frame rate
+  and bitrate (`{:subscribe, pid, params}`) so a camera with its own encoder starts that
+  stream. Each sink pipeline decodes with the decoder chosen for it. A sink added to a
+  running session (`add_sink/3`, `Home.Render.move/2`) must take the running stream
+  (`accepts/4`).
+* **Dry run**: `Home.Media.Video.check(source_ref, sink_refs, opts)` negotiates from the
+  registry without leasing anything.
+
+Nodes running a home_base from before this have no `video:`: their cameras count as
+x264's and their displays as decoding their own way, and their pipelines ignore the
+path. Tests: `test/media_video_test.exs` (the rules), `test/video_negotiation_test.exs`
+(a display whose "hardware" takes at most 640×480: a 720p x264 camera is scaled to
+640×360, a fixed 720p high-profile stream is refused unless that display decodes in
+software, and a display that can't take a running stream can't join it).
+
 ## Adapters
 
 * `Home.Adapters.Video.SynthCamera` (`Home.Media.SynthVideo`): real-time paced I420 test
@@ -118,6 +161,12 @@ and PLIs from each sink. `Home.Media.Session.stats/1` has both ends' view.
 
 After a loss the receiver drops frames until a keyframe (a frozen picture rather than a
 smeared one) and sends a PLI, repeated every 250 ms while it waits.
+
+A packet the sending socket refuses is a loss too. `Membrane.UDP.Endpoint` raised on any
+send error, so a keyframe burst that filled the socket's send buffer (`:eagain`, seen
+from a camera node sending to a phone) ended the whole session. Both pipelines use
+`Home.Media.UDPEndpoint` instead, which drops that packet, counts it and logs at most
+every 5 s; NACKs and PLIs recover it like any other.
 
 ## Limits / not done
 

@@ -5,8 +5,15 @@ defmodule Home.Media.H264Relay do
   the decode/encode stages and only re-packetizes (`Home.Media.SourcePipeline`).
 
   `feed` is a process on this node that fans one stream out to many such sources. On
-  playing, the element monitors it and calls `GenServer.call(feed, {:subscribe, self()})`;
-  from then on the feed sends
+  playing, the element monitors it and calls `GenServer.call(feed, {:subscribe, self()})`,
+  or, when a video session negotiated the stream (`params`, set by
+  `Home.Media.SourcePipeline`), `GenServer.call(feed, {:subscribe, self(), params})` with
+
+      %{profile: atom | nil, width: w | nil, height: h | nil, framerate: fps | nil,
+        bitrate: bps | nil}
+
+  for a feed that can start its stream that way (a camera's own encoder); one with a
+  stream of its own ignores them. From then on the feed sends
 
       {:h264_relay, feed, {:au, annexb_payload, pts_ns, keyframe?}}
 
@@ -27,19 +34,27 @@ defmodule Home.Media.H264Relay do
   )
 
   def_options(
-    feed: [spec: GenServer.server(), description: "The process fanning the stream out."]
+    feed: [spec: GenServer.server(), description: "The process fanning the stream out."],
+    params: [
+      spec: map() | nil,
+      default: nil,
+      description: "The negotiated stream, for the feed to start with."
+    ]
   )
 
   @impl true
-  def handle_init(_ctx, opts), do: {[], %{feed: opts.feed, monitor: nil}}
+  def handle_init(_ctx, opts), do: {[], %{feed: opts.feed, params: opts.params, monitor: nil}}
 
   @impl true
   def handle_playing(_ctx, state) do
     format = %Membrane.H264{alignment: :au, stream_structure: :annexb}
     monitor = Process.monitor(state.feed)
 
+    subscribe =
+      if state.params, do: {:subscribe, self(), state.params}, else: {:subscribe, self()}
+
     try do
-      :ok = GenServer.call(state.feed, {:subscribe, self()})
+      :ok = GenServer.call(state.feed, subscribe)
       {[stream_format: {:output, format}], %{state | monitor: monitor}}
     catch
       :exit, _ -> {[stream_format: {:output, format}, end_of_stream: :output], state}

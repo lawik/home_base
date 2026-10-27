@@ -21,8 +21,20 @@ defmodule Home.Media do
   @default_ports 50_000..50_099
 
   @doc """
-  The H.264 decoder video sinks on this node use: `:software` (FFmpeg, then RGB), or a
-  Membrane filter from `config :home_base, video: [decoder: module | {module, opts}]`.
+  The H.264 decoder a video sink on this node uses when its session didn't negotiate one
+  (a session started on a node from before `Home.Media.Video`): the first of this node's
+  hardware decoders (`Home.Media.Video.decoders/0`), or else `:software`.
+  """
+  def video_decoder do
+    case Enum.find(Home.Media.Video.decoders(), & &1.hardware) do
+      nil -> :software
+      format -> decoder_element(format.element)
+    end
+  end
+
+  @doc """
+  The Membrane element for a decoder's `element` (see `Home.Media.Video.Format`):
+  `:software` (FFmpeg, then RGB), or a filter, `module` or `{module, opts}`.
 
   The filter takes Annex B access units (`%Membrane.H264{alignment: :au, stream_structure:
   :annexb}`) and puts out `%VideoInterop.Frame{}` buffers (`VideoInterop.Format`) or raw
@@ -30,13 +42,9 @@ defmodule Home.Media do
   `Membrane.V4L2.H264.Decoder` decodes with the Venus hardware into DMA-BUF frames that
   the renderer draws without a copy.
   """
-  def video_decoder do
-    case Keyword.get(Home.config(:video, []), :decoder, :software) do
-      :software -> :software
-      {module, opts} -> struct!(module, opts)
-      module when is_atom(module) -> module
-    end
-  end
+  def decoder_element(:software), do: :software
+  def decoder_element({module, opts}), do: struct!(module, opts)
+  def decoder_element(module) when is_atom(module), do: module
 
   @doc "This node's media address and UDP port range."
   def address do
@@ -51,7 +59,8 @@ defmodule Home.Media do
   Options: `:ssrc`, `:session`, `:cap`, `:codec` (`:opus` or `:h264`), `:kind` (`:audio_out`,
   or `:display` for video), `:jitter` (ms, 40), `:feedback` (RTCP feedback to send, a
   subset of `[:nack, :pli]`, both by default), `:playout` (audio: playout queue to keep in
-  ms, 20, or `false`; see `Home.Media.Playout`).
+  ms, 20, or `false`; see `Home.Media.Playout`), `:video_decoder` (video: the decoder the
+  session chose, a `Home.Media.Video.Format` of this node's; `video_decoder/0` without).
 
   For video, `endpoint` may be a display's `Home.Render.Compositor`; frames then go to
   the video element `target` of render session `owner` given as `surface: {owner, target}`
@@ -108,11 +117,21 @@ defmodule Home.Media do
 
   Options: `:ssrc`, `:session`, `:cap`, `:codec` (`:opus` or `:h264`), `:kind`
   (`:audio_in` or `:video_in`), `:bitrate` (64 kbps for Opus, 3 Mbps for H.264),
-  `:application` (Opus, `:voip`), `:gop_size` (H.264 frames between keyframes, 30).
+  `:application` (Opus, `:voip`), `:gop_size` (H.264 frames between keyframes, 30),
+  `:video` (the negotiated `Home.Media.Video.Path`, whose bitrate wins over `:bitrate`).
   """
   def start_source(endpoint, destinations, opts) do
     opts = Map.new(opts)
     video? = Map.get(opts, :codec) == :h264
+
+    opts =
+      case opts do
+        %{video: %Home.Media.Video.Path{bitrate: bitrate}} when is_integer(bitrate) ->
+          Map.put(opts, :bitrate, bitrate)
+
+        _ ->
+          opts
+      end
 
     routes = Keyword.get(Home.config(:media, []), :routes, %{})
 

@@ -10,9 +10,12 @@ defmodule Home.Media.SinkPipeline do
       ... -> RTP H.264 depayloader (access units, on the RTP marker) -> H.264 parser
         -> H.264 decoder -> to RGB -> endpoint
 
-  The decoder is FFmpeg's, in software, unless the node has another in `config :home_base,
-  video: [decoder: ...]` (see `Home.Media.video_decoder/0`), such as a hardware one; its
-  frames then go to the endpoint as they come out, without the conversion to RGB.
+  The decoder is the one the session's negotiation chose for this sink (`:video_decoder`,
+  a `Home.Media.Video.Format` of this node's, see `Home.Media.Video`): FFmpeg's, in
+  software, or a filter such as a hardware decoder, whose frames go to the endpoint as
+  they come out, without the conversion to RGB. A session from a node without
+  negotiation gives none, and this node's default decoder (`Home.Media.video_decoder/0`)
+  is used.
 
   The RTCP receiver's feedback (receiver reports, NACKs, PLIs) goes back out of the same
   UDP endpoint to wherever the RTP comes from (see `Home.Media.RTCP`). After a loss the
@@ -36,7 +39,7 @@ defmodule Home.Media.SinkPipeline do
     spec = [
       # The destination is only a placeholder: feedback goes back to the RTP's sender
       # (`latch?`), and nothing is sent before the first RTP packet.
-      child(:udp, %Membrane.UDP.Endpoint{
+      child(:udp, %Home.Media.UDPEndpoint{
         local_port_no: opts.port,
         local_address: opts.ip,
         destination_address: opts.ip,
@@ -63,10 +66,16 @@ defmodule Home.Media.SinkPipeline do
     {[spec: spec], Map.merge(opts, %{rtp: %{}, playout_stats: nil})}
   end
 
-  defp decode(demuxer, %{codec: :h264}) do
+  defp decode(demuxer, %{codec: :h264} = opts) do
+    decoder =
+      case Map.get(opts, :video_decoder) do
+        %Home.Media.Video.Format{element: element} -> Home.Media.decoder_element(element)
+        nil -> Home.Media.video_decoder()
+      end
+
     demuxer
     |> child(:depayloader, Home.Media.H264Depayloader)
-    |> decode_h264(Home.Media.video_decoder())
+    |> decode_h264(decoder)
   end
 
   defp decode(demuxer, opts) do
